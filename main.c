@@ -49,7 +49,7 @@
  * would be a lot of ROM for nothing. BG ids must stay below 128 whatever gets
  * added here: LCDC bit 4 is 0, so >= 128 aliases into the sprite tiles. */
 #define T_FONT       18
-#define FONT_LEN     13
+#define FONT_LEN     24
 
 /* Sprite tile ids (8x16 mode: bubble colour c at c*4) */
 #define S_DOT        16
@@ -95,7 +95,7 @@ static const int8_t ANG_DY[NUM_ANGLES] = {
 static uint8_t  board[GRID_ROWS][GRID_COLS];   /* 0 = empty, else colour+1 */
 static uint8_t  parity;        /* toggles on every ceiling drop            */
 static uint8_t  level;
-static uint16_t score;         /* not displayed yet */
+static uint16_t score;         /* shown in the launcher strip by draw_score() */
 
 /* A row's horizontal shift. Using a parity flag means a ceiling drop just
  * moves the rows down and toggles it: every existing row keeps its shift. */
@@ -234,10 +234,13 @@ static void draw_board(void)
     }
 }
 
+static void draw_score(void);          /* defined with the font, further down */
+
 static void redraw_all(void)
 {
     DISPLAY_OFF;
     draw_board();
+    draw_score();
     DISPLAY_ON;
 }
 
@@ -394,6 +397,7 @@ static uint8_t resolve(uint8_t r, uint8_t c)
     }
     extra = drop_floating();
     score += (uint16_t)n * 10 + (uint16_t)extra * 20;
+    draw_score();
     return 1;
 }
 
@@ -594,12 +598,13 @@ static void flash(uint8_t times)
  * on a baseline. Written as shapes rather than as tile bytes because a tile needs
  * its two bit planes interleaved, and doing that in load_font() keeps the shapes
  * legible here. Ink is colour 3, black against the blank background. */
-static const char FONT_ORDER[] = " ABELNOPRSTUZ";
+static const char FONT_ORDER[] = " ABCELNOPRSTUZ0123456789";
 
 static const uint8_t FONT_GLYPHS[FONT_LEN][8] = {
     { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 },   /* space */
     { 0x70,0x88,0x88,0xF8,0x88,0x88,0x88,0x00 },   /* A */
     { 0xF0,0x88,0x88,0xF0,0x88,0x88,0xF0,0x00 },   /* B */
+    { 0x70,0x88,0x80,0x80,0x80,0x88,0x70,0x00 },   /* C */
     { 0xF8,0x80,0x80,0xF0,0x80,0x80,0xF8,0x00 },   /* E */
     { 0x80,0x80,0x80,0x80,0x80,0x80,0xF8,0x00 },   /* L */
     { 0x88,0xC8,0xA8,0x98,0x88,0x88,0x88,0x00 },   /* N */
@@ -610,6 +615,16 @@ static const uint8_t FONT_GLYPHS[FONT_LEN][8] = {
     { 0xF8,0x20,0x20,0x20,0x20,0x20,0x20,0x00 },   /* T */
     { 0x88,0x88,0x88,0x88,0x88,0x88,0x70,0x00 },   /* U */
     { 0xF8,0x08,0x10,0x20,0x40,0x80,0xF8,0x00 },   /* Z */
+    { 0x70,0x88,0x88,0x88,0x88,0x88,0x70,0x00 },   /* 0 */
+    { 0x20,0x60,0x20,0x20,0x20,0x20,0x70,0x00 },   /* 1 */
+    { 0x70,0x88,0x08,0x10,0x20,0x40,0xF8,0x00 },   /* 2 */
+    { 0xF8,0x10,0x20,0x10,0x08,0x88,0x70,0x00 },   /* 3 */
+    { 0x10,0x30,0x50,0x90,0xF8,0x10,0x10,0x00 },   /* 4 */
+    { 0xF8,0x80,0xF0,0x08,0x08,0x88,0x70,0x00 },   /* 5 */
+    { 0x30,0x40,0x80,0xF0,0x88,0x88,0x70,0x00 },   /* 6 */
+    { 0xF8,0x08,0x10,0x20,0x20,0x20,0x20,0x00 },   /* 7 */
+    { 0x70,0x88,0x88,0x70,0x88,0x88,0x70,0x00 },   /* 8 */
+    { 0x70,0x88,0x88,0x78,0x08,0x10,0x60,0x00 },   /* 9 */
 };
 
 static void load_font(void)
@@ -632,7 +647,8 @@ static uint8_t font_tile(char ch)
     return T_FONT;                              /* anything else -> space */
 }
 
-/* Only safe while the display is off: it writes to VRAM directly. */
+/* Writes BG tiles one at a time, the same call draw_cell() makes, so it is safe
+ * mid-game as well as under DISPLAY_OFF. */
 static void draw_text(uint8_t col, uint8_t row, const char *s)
 {
     uint8_t t;
@@ -640,6 +656,34 @@ static void draw_text(uint8_t col, uint8_t row, const char *s)
         t = font_tile(*s++);
         set_bkg_tiles(col++, row, 1, 1, &t);
     }
+}
+
+/* The launcher strip (BG rows 16-17) is the only free space on screen: the grid
+ * owns rows 0-15 and the walls the outer columns. The sprites there -- the "next"
+ * preview at x 32 and the launcher at x 80 -- leave cols 12-17 clear, so the score
+ * is right-aligned against the wall. "SCORE" and the number are stacked rather
+ * than side by side: eleven tiles will not fit in the six columns the sprites
+ * leave free, but two 8px text rows stack into the 16px strip. */
+#define SCORE_COL     12
+#define SCORE_ROW     16
+#define SCORE_LABEL   "SCORE"
+#define SCORE_DIGITS  5              /* 65535 fits; the score is uint16_t */
+
+/* Zero-padded, so the field never reflows as it grows. */
+static void draw_score(void)
+{
+    char s[SCORE_DIGITS + 1];
+    uint16_t v = score;
+    int8_t i;
+
+    draw_text(SCORE_COL, SCORE_ROW, SCORE_LABEL);
+
+    s[SCORE_DIGITS] = 0;
+    for (i = SCORE_DIGITS - 1; i >= 0; i--) {     /* five divides, once per shot */
+        s[i] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    draw_text(SCORE_COL, SCORE_ROW + 1, s);
 }
 
 /* ---------------- title screen ---------------- */
@@ -672,18 +716,18 @@ static uint16_t title_screen(void)
             board[r][c] = (uint8_t)(((r + c) & 3) + 1);   /* diagonal banding */
     }
 
-    /* The text goes down inside the same display-off window as the board rather
-     * than after redraw_all(): draw_text writes VRAM directly, so it cannot run
-     * with the LCD on. */
+    /* The text goes down inside the same display-off window as the board, and so
+     * does the strip below the grid: the score from a just-finished game lives
+     * there, and the title must not come back with it still hanging over it. */
     DISPLAY_OFF;
     draw_board();
+    fill_bkg_rect(2, SCORE_ROW, 16, 2, T_BLANK);      /* launcher strip, walls kept */
     draw_text(3, 12, TITLE_NAME);
     draw_text(4, 14, TITLE_PROMPT);
     DISPLAY_ON;
 
-    /* No font yet, so the prompt is the launcher bubble pulsing: with nothing to
-     * spell, a moving bubble says "this is interactive" more directly than text
-     * would anyway. */
+    /* The prompt is also the launcher bubble pulsing: a moving bubble says "this
+     * is interactive" more directly than the text alone does. */
     for (;;) {
         place_bubble_sprite(SPR_FLY,  (uint8_t)((waited & 8) ? 1 : 2),
                             LAUNCH_X, LAUNCH_Y);

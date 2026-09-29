@@ -27,9 +27,11 @@ WALL_TILES = 18 * 4     # both side walls, full height
 TITLE_COUNT = [8, 7, 6, 5, 4, 3]
 TITLE_START = [0, 0, 1, 1, 2, 2]
 T_FONT = 18                              # first font tile id
-FONT_ORDER = " ABELNOPRSTUZ"             # glyph order, matches FONT_ORDER in main.c
+FONT_ORDER = " ABCELNOPRSTUZ0123456789"   # glyph order, matches FONT_ORDER in main.c
 TITLE_TEXT = [("PUZZLE BALLOON", 3, 12),  # string, tile column, tile row
               ("PRESS START", 4, 14)]
+SCORE_LABEL = "SCORE"                     # label row, then the digits under it
+SCORE_COL, SCORE_ROW, SCORE_DIGITS = 12, 16, 5
 
 
 def expected_title_map():
@@ -61,6 +63,28 @@ def expected_title_map():
 
 def tile(py, col, row):
     return py.memory[MAP + row * 32 + col]
+
+
+T_ZERO = T_FONT + FONT_ORDER.index("0")
+
+
+def score(py):
+    """The score as an int, or None if the field is not label + five digits.
+
+    "SCORE" sits on the row above the number, zero-padded and right-aligned in the
+    launcher strip, so a wrong width, a missing label or a stray tile shows up here
+    rather than as a silently wrong number.
+    """
+    want = [T_FONT + FONT_ORDER.index(ch) for ch in SCORE_LABEL]
+    if [tile(py, c, SCORE_ROW) for c in range(SCORE_COL, SCORE_COL + len(SCORE_LABEL))] != want:
+        return None
+    n = 0
+    for c in range(SCORE_COL, SCORE_COL + SCORE_DIGITS):
+        t = tile(py, c, SCORE_ROW + 1)
+        if not T_ZERO <= t <= T_ZERO + 9:
+            return None
+        n = n * 10 + (t - T_ZERO)
+    return n
 
 
 def bubble_tiles(py):
@@ -206,6 +230,26 @@ def main():
     # Which shot strands bubbles is not predictable, so fire until one does.
     assert any(fall_watch(py, frames) for _ in range(40)), \
         "no floater was seen falling after 40 shots"
+
+    # The score. It shows from the start of the level, so it must already read as
+    # five digits; it must then move when bubbles pop. Which shot lands a match is
+    # not predictable, so keep firing until one does.
+    assert score(py) is not None, "score field is not SCORE + five digits (tiles %s / %s)" % \
+        ([tile(py, c, SCORE_ROW) for c in range(SCORE_COL, SCORE_COL + SCORE_DIGITS)],
+         [tile(py, c, SCORE_ROW + 1) for c in range(SCORE_COL, SCORE_COL + SCORE_DIGITS)])
+
+    for _ in range(25):
+        if score(py):
+            break
+        frames(6, "left")
+        frames(3, "a")
+        frames(90)
+        # Harmless during play; restarts the game if the board filled up.
+        py.button_press("start")
+        py.tick(1, True)
+        py.button_release("start")
+    assert score(py), "score never moved"
+    final_score = score(py)            # the strip is blank again once the title is back
 
     print("ok: walls=%d start_tiles=%d counts=%s" % (walls, start, sorted(seen)))
     py.stop(save=False)
