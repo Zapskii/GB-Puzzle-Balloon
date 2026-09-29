@@ -9,9 +9,13 @@ hex grid. Groups of three or more of the same colour pop; anything left hanging 
 path back to the ceiling falls. The ceiling drops every few shots, and you lose if the
 bubbles reach the bottom row.
 
+Public repo: **<https://github.com/Zapskii/GB-Puzzle-Balloon>** — by Zapski.
+
 ## Build
 
 ```sh
+git clone https://github.com/Zapskii/GB-Puzzle-Balloon.git
+cd GB-Puzzle-Balloon
 make            # produces bubble.gb
 make usage      # ROM/RAM headroom
 ```
@@ -109,7 +113,11 @@ variables, so it needs no symbol map and does not break every time a global is a
 
 It also checks the shape of the SGB border data, because PyBoy is not a Super Game Boy
 and the upload itself never runs in the test — the sizes png2asset emits are what break
-quietly if `make border` is run with the wrong flags.
+quietly if `make border` is run with the wrong flags. Two more static checks cover mistakes
+that a tile-id comparison cannot see: `check_sgb_header()` (the two header bytes, without
+which no SGB ever shows a border) and `check_font_order()`, which asserts the `FONT_GLYPHS`
+comments spell out `FONT_ORDER` — a glyph row at the wrong index renders the wrong letter
+while every tile id still lines up.
 
 ## Layout notes for contributors
 
