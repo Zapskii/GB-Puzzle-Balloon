@@ -146,5 +146,4 @@ Two hardware limits shape the rendering: BG tile ids must stay below 128, becaus
 is clear and anything higher aliases into the sprite tiles; and the DMG draws at most 10
 sprites per scanline, which is why the fall animation staggers its floaters.
 
-Not done yet: no audio, no hand-designed levels (boards are random), and no "STAGE CLEAR"
-or "GAME OVER" text — those still need glyphs that the font does not have.
+Not done yet: no audio and no hand-designed levels (boards are random).
