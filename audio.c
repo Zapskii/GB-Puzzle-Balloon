@@ -58,10 +58,11 @@
 #define WARN_HZ        330u    /* E4-ish: low enough to read as "warning"       */
 
 /* --- CH4, sfx_pop: noise burst --- */
-#define POP_LEN        0x20u   /* NR41: (64-32)/256 = 0.125 s = ~7 frames       */
+#define POP_LEN        0x10u   /* NR41: (64-16)/256 = 0.1875 s = ~11 frames     */
 #define POP_ENV        0xF1u   /* NR42: volume 15, decay, pace 1                */
-#define POP_POLY       0x60u   /* NR43: 15-bit, divisor 0, clock shift 6
-                                * -> ~8192 Hz hiss                             */
+#define POP_POLY       0x80u   /* NR43: 15-bit, divisor 0, clock shift 8
+                                * -> ~2048 Hz: a thump, where shift 6's ~8192 Hz
+                                * hiss sat above what the DMG speaker does well  */
 
 /* ------------------------------------------------------------------------- */
 
