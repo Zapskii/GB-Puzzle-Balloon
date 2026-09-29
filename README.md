@@ -10,6 +10,7 @@ path back to the ceiling falls. The ceiling drops every few shots, and you lose 
 bubbles reach the bottom row.
 
 Public repo: **<https://github.com/Zapskii/GB-Puzzle-Balloon>** — by Zapski.
+Latest release: **v1.0** — <https://github.com/Zapskii/GB-Puzzle-Balloon/releases/tag/v1.0>
 
 ## Build
 
