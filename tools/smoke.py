@@ -259,6 +259,107 @@ def bubble_tiles(py):
                if 2 <= tile(py, c, r) <= 17)
 
 
+def board_address(py):
+    """Locate main.c's `board[8][8]` in WRAM by matching it against the screen.
+
+    The linker map lists no statics, so the only handle on the board is that its
+    bytes ARE what is drawn: 0 for an empty cell, colour + 1 otherwise, and
+    column 7 always empty in the shifted rows. The board's SCREEN position is
+    invariant (that is what the drop's SCY walk preserves), so this matches at any
+    settled moment, whatever map_y0 has become.
+
+    Which rows are shifted depends on `parity`, which is not readable from here
+    (SHIFTED(r) is (r ^ parity) & 1 and every drop toggles it), so both are tried
+    and the byte match decides.
+    """
+    def drawn(parity):
+        want = []
+        for r in range(8):
+            shifted = (r ^ parity) & 1
+            for c in range(8):
+                if shifted and c == 7:
+                    want.append(0)               # shifted rows never use col 7
+                    continue
+                t = tile(py, 2 + c * 2 + shifted, r * 2)
+                want.append((t - 2) // 4 + 1 if 2 <= t <= 17 else 0)
+        return want
+
+    hits = [a for parity in (0, 1) for a in range(0xC000, 0xE000 - 64)
+            if list(py.memory[a:a + 64]) == drawn(parity)]
+    assert len(hits) == 1, \
+        "found %d WRAM windows matching the drawn board, expected exactly 1" % len(hits)
+    return hits[0]
+
+
+def mask_from_ram(py, addr):
+    """The colours present in the board, read from RAM rather than the screen."""
+    m = 0
+    for a in range(64):
+        v = py.memory[addr + a]
+        if v:
+            m |= 1 << (v - 1)
+    return m
+
+
+def check_drop_keeps_colours(py, frames):
+    """A ceiling drop must not bring back a colour cleared off the board.
+
+    This is the bug the game shipped with: ceiling_drop() filled the new row with
+    `rand() & 3` regardless of what was left, while pick_colour() -- which feeds
+    the bubbles the player fires -- drew from the board only. A board narrowed to
+    two colours had all four handed back every eight shots, so a stage clear
+    could not be reached. Measured by forcing that state: blind play never gets
+    there in a smoke run, so a check that relies on it would never fail on the
+    broken build.
+
+    The board is rewritten in RAM (the screen keeps showing the old one, which is
+    why everything below the forced state is read from RAM), and the two colours
+    used are the two already picked, so nothing stale is compared.
+
+    This starts its own game, and leaves the board in a state that would CLEAR,
+    so it runs last: run before the game-over checks it turns the loss they need
+    into a stage clear.
+    """
+    for _ in range(150):
+        py.button_press("start")
+        py.tick(1, True)
+    py.button_release("start")
+    for _ in range(300):
+        py.tick(1, True)
+        if all(py.memory[0xFE01 + s * 4] for s in (4, 5, 6)):
+            break
+    addr = board_address(py)
+    cur, nxt = py.memory[0xFE02] >> 2, py.memory[0xFE02 + 2 * 4] >> 2
+    for a in range(64):
+        py.memory[addr + a] = 0
+    py.memory[addr + 0 * 8 + 0] = cur + 1        # col 0 is valid in either parity
+    py.memory[addr + 1 * 8 + 0] = nxt + 1
+    start_mask = mask_from_ram(py, addr)
+    assert bin(start_mask).count("1") == 2, "forcing the two-colour board failed"
+
+    slid, prev = False, None
+    for shot in range(30):
+        frames(4, "left" if shot % 2 else "right")
+        frames(3, "a")
+        for _ in range(60):
+            py.tick(1, True)
+            scy = py.memory[SCY_REG]
+            if scy % 8:
+                slid = True
+            elif slid and scy and scy == prev:
+                now = mask_from_ram(py, addr)
+                assert not (now & ~start_mask), \
+                    "a ceiling drop brought back colour(s) %s that were cleared " \
+                    "off the board (mask %s -> %s)" % (
+                        format(now & ~start_mask, "04b"),
+                        format(start_mask, "04b"), format(now, "04b"))
+                return
+            prev = scy
+        # Harmless during play; restarts the game if the board filled up.
+        frames(1, "start")
+    raise AssertionError("no ceiling drop within 30 shots of the forced board")
+
+
 def is_title(py):
     """True when every one of the 20x18 tiles matches the title screen."""
     want = expected_title_map()
@@ -600,6 +701,12 @@ def main():
     skip = game_over_to_title(py, frames, skip=True)
     assert skip is not None and 0 < skip < 280, \
         "A did not cut the game-over hold short (%s frames)" % skip
+
+    # ...and that a ceiling drop does not hand back colours the player has cleared
+    # off the board. Last, because it leaves the board in a clearable state. See
+    # check_drop_keeps_colours(): blind play never narrows the board far enough for
+    # this to happen on its own, so the state is forced.
+    check_drop_keeps_colours(py, frames)
 
     print("ok: sgb_border=%s walls=%d start_tiles=%d counts=%s score=%d "
           "drop_scy=%d mid=%d game_over->title=%d frames (A: %d)"

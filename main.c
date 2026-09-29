@@ -481,8 +481,12 @@ static void ceiling_drop(void)
     parity ^= 1;
     memset(board[0], 0, GRID_COLS);
     n = ROW_COLS(0);
+    /* The new row draws from the colours still on the board, like pick_colour().
+     * A plain `rand() & 3` here resurrects colours the player has just cleared
+     * off the board -- every drop handed back the two the player had eliminated,
+     * so a stage clear could never be reached. */
     for (c = 0; c < n; c++)
-        board[0][c] = (uint8_t)((rand() & 3) + 1);
+        board[0][c] = (uint8_t)(pick_colour() + 1);
 
     map_y0 = (uint8_t)((map_y0 - 2) & 31);
     /* Blank the slot first: a shifted row only fills 7 of the 8 cells, and the
