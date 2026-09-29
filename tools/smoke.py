@@ -74,6 +74,39 @@ def wall_count(py):
                if tile(py, c, r) == 1)
 
 
+def aim_up(py, frames):
+    """Fire with no steering and report whether the shot went exactly vertical.
+
+    The default angle has to be dead up. A 15 + 10k sweep never lands on 90 deg,
+    so before ANG_MID existed the nearest shots were 85 and 95 deg and drifted
+    ~12px over the playfield's height -- more than half a bubble, enough to miss
+    anything directly above the launcher. Both halves are checked: the preview
+    dots (all one x) and the flight itself, since only the flight proves fdx is
+    really zero rather than merely small.
+    """
+    dots = set(py.memory[0xFE01 + s * 4] for s in (4, 5, 6))   # aim dots, x bytes
+    if len(dots) != 1 or 0 in dots:
+        return False
+    frames(1, "a")
+    prev, x, seen = 0, None, False
+    for _ in range(60):
+        py.tick(1, True)
+        oy, ox = py.memory[0xFE00], py.memory[0xFE01]
+        if not oy or oy >= 144:             # hidden, or still sitting in the launcher
+            if seen:
+                break
+            continue
+        if prev and oy >= prev:             # stopped rising: it has landed
+            break
+        seen = True
+        if x is None:
+            x = ox
+        elif ox != x:
+            return False                    # drifted sideways in flight
+        prev = oy
+    return seen
+
+
 # The fall animation's sprite slots: 2 sprites per floater, from SPR_FALL up.
 # Slots 0-7 are the launcher, the next bubble and the aim dots. Must match main.c.
 FALL_SLOTS = list(range(8, 8 + 2 * 12))
@@ -154,6 +187,9 @@ def main():
 
     start = bubble_tiles(py)
     assert start >= 24, "starting board is empty (%d tiles)" % start
+
+    # The un-steered shot must be exactly vertical -- see aim_up().
+    assert aim_up(py, frames), "the default aim is not straight up"
 
     # Fire a few shots; each should stick somewhere, so the board must change.
     seen = {start}

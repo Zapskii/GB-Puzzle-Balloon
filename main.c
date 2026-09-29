@@ -73,15 +73,21 @@
 
 /* ---------------- fixed-point aim table ----------------
  * 12.4 fixed point (16 units = 1px), speed = 4px/frame = 64 units.
- * 16 angles from 15 deg (right) to 165 deg (left) in 10 deg steps.
+ * 15 deg (right) to 165 deg (left) in 10 deg steps, PLUS the exact vertical
+ * at index ANG_MID: a 15 + 10k sweep never lands on 90 deg, and the nearest
+ * shots (85/95 deg) drift ~12px over the playfield's height -- more than half
+ * a bubble -- so a target directly above the launcher could not be hit.
  * Index increases towards the left.                                  */
-#define NUM_ANGLES 16
+#define ANG_MID    8
+#define NUM_ANGLES 17
 static const int8_t ANG_DX[NUM_ANGLES] = {
      62,  58,  52,  45,  37,  27,  17,   6,
+      0,
      -6, -17, -27, -37, -45, -52, -58, -62
 };
 static const int8_t ANG_DY[NUM_ANGLES] = {
     -17, -27, -37, -45, -52, -58, -62, -64,
+    -64,
     -64, -62, -58, -52, -45, -37, -27, -17
 };
 
@@ -488,7 +494,7 @@ static uint8_t snap(uint8_t cx, uint8_t cy, uint8_t *pr, uint8_t *pc)
 /* returns 1 = level cleared, 0 = game over */
 static uint8_t play(void)
 {
-    uint8_t cur, next, ang = 7, rep = 0, keys, prev = 0xFF, shots = 0;
+    uint8_t cur, next, ang = ANG_MID, rep = 0, keys, prev = 0xFF, shots = 0;
     uint8_t drop_every = (level >= 5) ? 3 : (uint8_t)(8 - level);
     uint8_t i, hit, r, c, mask;
     int16_t fx, fy, fdx, fdy, cx, cy;
