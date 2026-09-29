@@ -131,6 +131,115 @@ def check_font_order(path=None):
     return len(order)
 
 
+LOSE_ROW = 7                            # GRID_ROWS - 1: the row that loses the game
+
+
+def c_ternary_to_python(src):
+    """Rewrite a C expression's `?:` as Python conditional expressions.
+
+    The difficulty check below reads main.c's own expressions instead of repeating
+    the numbers, so it has to evaluate C. `?:` is the only thing Python spells
+    differently, which makes the translation a balanced-paren scan rather than a
+    parser: take the first `?`, run back to the start of its group for the
+    condition, take its `:` and the end of that group for the two arms, and rewrite
+    the three as `a if cond else b`. Innermost first, so nesting works out. The
+    casts go first -- the arithmetic in here is all int8/uint8 and dropping
+    `(uint8_t)` changes nothing about its value.
+    """
+    src = re.sub(r"\((?:u?int(?:8|16|32)_t|unsigned char)\)", "", src)
+    while "?" in src:
+        i = src.index("?")
+        j, depth = i - 1, 0                # back to the start of the condition
+        while j >= 0:
+            if src[j] == ")":
+                depth += 1
+            elif src[j] == "(":
+                if not depth:
+                    break
+                depth -= 1
+            j -= 1
+        k, depth = i + 1, 0                # forward to the ternary's `:`
+        while k < len(src):
+            if src[k] == "(":
+                depth += 1
+            elif src[k] == ")":
+                if not depth:
+                    break
+                depth -= 1
+            elif src[k] == ":" and not depth:
+                break
+            k += 1
+        assert k < len(src) and src[k] == ":", \
+            "cannot read the C expression %r: update this check" % src
+        e, depth = k + 1, 0                # and on to the end of the else arm
+        while e < len(src):
+            if src[e] == "(":
+                depth += 1
+            elif src[e] == ")":
+                if not depth:
+                    break
+                depth -= 1
+            e += 1
+        src = "%s((%s) if %s else (%s))%s" % (src[:j + 1], src[i + 1:k].strip(),
+                                              src[j + 1:i].strip(),
+                                              src[k + 1:e].strip(), src[e:])
+    return src
+
+
+def level_expr(src, pattern, name):
+    """One of main.c's level-dependent expressions, as a function of the level.
+
+    The eval() is on a snippet of this repo's own main.c, with builtins removed and
+    bound to a single name (`level`), so the worst a bad expression can do is fail
+    to compile.
+    """
+    m = re.search(pattern, src)
+    assert m, "main.c has no %s matching %r: update this check" % (name, pattern)
+    code = compile(c_ternary_to_python(m.group(1)), name, "eval")
+    return lambda lv: eval(code, {"__builtins__": {}}, {"level": lv})
+
+
+def check_difficulty(path=None):
+    """The ramp has to leave room to play, at every level.
+
+    Two properties, both read out of main.c's own expressions -- the numbers are
+    the check, so they are evaluated rather than repeated here:
+
+      * at least two free rows above LOSE_ROW. `4 + (level > 2 ? 2 : level)` starts
+        the pile 6 rows deep from level 2, leaving exactly one free row, which is
+        not a board that can be played.
+      * the ceiling drop never comes round more often than every 4 shots. A drop
+        adds a full row (~7.5 bubbles) and three shots take 9 off at best, so a
+        3-shot interval loses ground every cycle.
+
+    This is a SOURCE check, not a play check: `level` only rises on a cleared board
+    and nothing headless clears one, so a smoke run never gets past level 1 and the
+    rest of the ramp is unreachable from the emulator.
+    """
+    src = open(path or os.path.join(HERE, os.pardir, "main.c")).read()
+    rows = level_expr(src, r"init_board\(\(uint8_t\)\s*\((.*?)\)\);", "init_board")
+    every = level_expr(src, r"drop_every\s*=\s*(.*?);", "drop_every")
+
+    depths = [rows(lv) for lv in range(64)]
+    gaps = [every(lv) for lv in range(64)]
+    for lv, n in enumerate(depths):
+        assert 1 <= n <= LOSE_ROW - 2, \
+            "level %d starts the pile %d rows deep: %d free row(s) above LOSE_ROW " \
+            "(%d), and at least 2 are needed to play in" % (
+                lv, n, LOSE_ROW - n, LOSE_ROW)
+    for lv, d in enumerate(gaps):
+        assert d >= 4, \
+            "level %d drops the ceiling every %d shots: a drop adds ~7.5 bubbles " \
+            "and three shots clear ~9, so the pile wins every cycle" % (lv, d)
+    # A ramp, not a constant, and one that only ever gets harder with the level.
+    assert len(set(depths)) > 1, "the starting depth never changes: no ramp (%s)" % depths[0]
+    assert len(set(gaps)) > 1, "the drop interval never changes: no ramp (%s)" % gaps[0]
+    assert all(gaps[lv] >= gaps[lv + 1] for lv in range(63)), \
+        "the drop interval goes back up with the level: %s" % gaps
+    return "rows<=%d, drop every %d..%d shots" % (
+        max(depths), min(gaps), max(gaps))
+
+
 def expected_title_map():
     """The whole BG map the title screen should produce, as tile ids.
 
@@ -454,6 +563,47 @@ def aim_up(py, frames):
     return seen
 
 
+def first_press_fires(py, frames):
+    """Leave the title, and fire on the new board's first press -- no release first.
+
+    The aim loop breaks on `(keys & A|B) && !(prev & A|B)`. With prev starting at
+    0xFF that test cannot be true for a first press: it needs a RELEASE to have been
+    seen, so the press that should have fired the shot is swallowed and nothing
+    happens until the player presses again. Nothing checked this before -- aim_up()
+    is the only other check that reads OAM across a shot, and it presses A on three
+    frames in a row, which is exactly the shape that hides it.
+
+    A has to be down on the aim loop's FIRST frame or the old code fires anyway (by
+    the second frame prev is 0 and an ordinary press works), and the only moment
+    that is provably before play() starts and observably so is the redraw, which
+    runs with the LCD off. So: leave the title, wait for LCDC bit 7 to go clear,
+    then press A and keep it down. That is not a synthetic state -- it is what
+    mashing A through a stage clear looks like (waitpad(J_START), waitpadup(),
+    redraw_all(), play()). LCDC reads off at the end of a frame only if DISPLAY_ON
+    has not run yet, so anything pressed then is down before play() is reached.
+
+    The shot shows up as the launcher sprite leaving the strip: play() parks it at
+    OAM y 144 (LAUNCH_Y 136 + 8) and every frame of flight is above that.
+    """
+    assert is_title(py), "not at the title screen: this would press into a game"
+    frames(1, "start")                      # the title's own press, then released
+    for _ in range(200):                    # ...so waitpadup() lets the redraw run
+        py.tick(1, True)
+        if not py.memory[LCDC_REG] & 0x80:
+            break
+    else:
+        raise AssertionError("the board redraw never turned the LCD off")
+    py.button_press("a")                    # held from here, never released
+    for _ in range(240):
+        py.tick(1, True)
+        y = py.memory[0xFE00]
+        if 0 < y < 144:                     # the launcher sprite is in flight
+            py.button_release("a")
+            return True
+    py.button_release("a")
+    return False
+
+
 # The fall animation's sprite slots: 2 sprites per floater, from SPR_FALL up.
 # Slots 0-7 are the launcher, the next bubble and the aim dots. Must match main.c.
 FALL_SLOTS = list(range(8, 8 + 2 * 12))
@@ -543,6 +693,7 @@ def main():
     border = check_border_data()
     check_sgb_header(rom)
     check_font_order()
+    ramp = check_difficulty()
     py = PyBoy(rom, window="null", sound_emulated=False)
 
     def frames(n, key=None):
@@ -569,15 +720,13 @@ def main():
     # bubble as sprites, so the picture reads as ready to play.
     assert py.memory[0xFE00] != 0, "title screen shows no launcher sprite"
 
-    # main() runs the DMG boot ROM, generates the bubble tiles, then parks in
-    # `while (!(joypad() & (J_START | J_A)))`. Hold START across that whole
-    # window, then RELEASE it: the release is what lets `waitpadup()` through,
-    # and the board is not built until it does. A press/release per frame is not
-    # enough here -- the hold has to span frames for the boot wait to see it.
-    for _ in range(150):
-        py.button_press("start")
-        py.tick(1, True)
-    py.button_release("start")
+    # The first press on a new board. This also leaves the title screen, which the
+    # title being up and checked above makes safe: main()'s boot wait is over, so
+    # one press/release is enough to get past `while (!(joypad() & (START|A)))` and
+    # the waitpadup() behind it. See first_press_fires().
+    assert first_press_fires(py, frames), \
+        "the first A press on a new board was swallowed: no shot fired with the " \
+        "button held down from before the board was drawn"
 
     # Wait for the walls, then let the redraw finish. draw_board lays the walls
     # down first and the bubbles after, so a snapshot taken the moment the walls
@@ -708,9 +857,9 @@ def main():
     # this to happen on its own, so the state is forced.
     check_drop_keeps_colours(py, frames)
 
-    print("ok: sgb_border=%s walls=%d start_tiles=%d counts=%s score=%d "
+    print("ok: sgb_border=%s walls=%d ramp=%s start_tiles=%d counts=%s score=%d "
           "drop_scy=%d mid=%d game_over->title=%d frames (A: %d)"
-          % (border, walls, start, sorted(seen), final_score, max(settled),
+          % (border, walls, ramp, start, sorted(seen), final_score, max(settled),
              len(mid), gap, skip))
     py.stop(save=False)
 

@@ -90,10 +90,11 @@ The default aim is straight up, and the sweep is symmetric about it.
 
 Each popped bubble is 10 points, and each stranded bubble that falls is 20.
 
-Clearing a board advances the level: the next board starts with up to two rows more, and
-the ceiling drops more often (every `8 - level` shots, down to a floor of 3). Clearing
-all the bubbles wins the level; bubbles on the bottom row lose the game. Losing returns
-to the title screen by itself after about five seconds, resetting the score and level.
+Clearing a board advances the level: the next board starts a row deeper (four rows of bubbles at
+the start, five from level 2, never more than five), and the ceiling drops more often (every
+`8 - level` shots, down to a floor of 4). Clearing all the bubbles wins the level; bubbles on the
+bottom row lose the game. Losing returns to the title screen by itself after about five seconds,
+resetting the score and level.
 
 ## Tests
 
@@ -105,11 +106,16 @@ make shot       # screenshot + scripted input, for eyeballing one frame
 `make test` boots the ROM, starts a game and fires shots, then reads the BG tilemap, the
 window tilemap and the sprite table to assert the game actually plays: the title screen
 matches tile for tile, the walls are drawn, shots land and the board changes, stranded
-bubbles fall, the score reads and moves, the default shot flies dead straight, a ceiling
-drop slides the board instead of flashing it (SCY leaves 0, is caught mid-slide, the LCD
-stays on, and the new row is on screen at the top when it settles), and a game over hands
-back to the title on time. It deliberately checks tile ids rather than the game's own
-variables, so it needs no symbol map and does not break every time a global is added.
+bubbles fall, the score reads and moves, the default shot flies dead straight, a board's
+first press fires without needing a release first, a ceiling drop slides the board instead
+of flashing it (SCY leaves 0, is caught mid-slide, the LCD stays on, and the new row is on
+screen at the top when it settles), and a game over hands back to the title on time. It
+deliberately checks tile ids rather than the game's own variables, so it needs no symbol map
+and does not break every time a global is added.
+
+It also checks the difficulty curve's two numbers straight out of `main.c` (at least two free rows
+above the losing row at every level, and a ceiling drop no more often than every four shots), since
+a headless run never clears a board and so never gets past level 1 to measure them in play.
 
 It also checks the shape of the SGB border data, because PyBoy is not a Super Game Boy
 and the upload itself never runs in the test — the sizes png2asset emits are what break

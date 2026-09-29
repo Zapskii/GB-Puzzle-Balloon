@@ -560,8 +560,22 @@ static uint8_t snap(uint8_t cx, uint8_t cy, uint8_t *pr, uint8_t *pc)
 /* returns 1 = level cleared, 0 = game over */
 static uint8_t play(void)
 {
-    uint8_t cur, next, ang = ANG_MID, rep = 0, keys, prev = 0xFF, shots = 0;
-    uint8_t drop_every = (level >= 5) ? 3 : (uint8_t)(8 - level);
+    /* prev starts at 0 -- "nothing was down" -- which is only true because the pad
+     * really is up when play() starts: all three ways in release it first.
+     * title_screen() ends in waitpadup(), the stage-clear path does waitpadup()
+     * after waitpad(J_START), and the game-over path goes through wait_or_skip(),
+     * which releases the pad before and after its hold. Nothing between those
+     * releases and the aim loop reads the pad, so a button down on the loop's first
+     * frame was pressed after the release: a fresh press, which must fire. Starting
+     * at 0xFF instead meant the aim-break test below -- (keys & A|B) && !(prev &
+     * A|B) -- could not fire until a RELEASE had been seen, silently swallowing the
+     * first press of every board. */
+    uint8_t cur, next, ang = ANG_MID, rep = 0, keys, prev = 0, shots = 0;
+    /* Ceiling-drop interval, in shots. It shortens with the level but floors at 4,
+     * never 3: a drop adds a full row (about 7.5 bubbles) and only three perfect
+     * shots take 9 off, so at 3 the pile grows faster than a good player can clear
+     * it. The ramp stays -- one shot fewer per level down to the floor. */
+    uint8_t drop_every = (level >= 4) ? 4 : (uint8_t)(8 - level);
     uint8_t i, hit, r, c, mask;
     int16_t fx, fy, fdx, fdy, cx, cy;
 
@@ -986,7 +1000,13 @@ void main(void)
         score  = 0;
 
         for (;;) {
-            init_board((uint8_t)(4 + (level > 2 ? 2 : level)));
+            /* Starting depth of the pile: four rows, five from level 1, and five is
+             * the ceiling. LOSE_ROW is row 7, so six starting rows left exactly one
+             * free row and the game was close to unwinnable -- five leaves rows 5
+             * and 6 free, which is the least a player can be asked to work in. The
+             * ramp is kept (the board still deepens with the level); past level 1 it
+             * is the drop interval below that carries the difficulty. */
+            init_board((uint8_t)(4 + (level > 0 ? 1 : 0)));
             redraw_all();
             won = play();
             hide_all_sprites();
