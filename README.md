@@ -117,6 +117,12 @@ It also checks the difficulty curve's two numbers straight out of `main.c` (at l
 above the losing row at every level, and a ceiling drop no more often than every four shots), since
 a headless run never clears a board and so never gets past level 1 to measure them in play.
 
+Sound is checked in its own console, because the PyBoy the rest of the tests use runs with
+`sound_emulated=False`, where every sound register reads 0 and every write is discarded. Each effect
+has to reach the APU on its own channel: CH1 on firing, CH2 on a wall bounce, CH4 on a pop, and CH3
+on the ceiling drop's warning — which has to sound a whole shot *before* the drop, so that check
+measures the gap between the warning and the slide rather than just its presence.
+
 It also checks the shape of the SGB border data, because PyBoy is not a Super Game Boy
 and the upload itself never runs in the test — the sizes png2asset emits are what break
 quietly if `make border` is run with the wrong flags. Two more static checks cover mistakes
@@ -146,4 +152,13 @@ Two hardware limits shape the rendering: BG tile ids must stay below 128, becaus
 is clear and anything higher aliases into the sprite tiles; and the DMG draws at most 10
 sprites per scanline, which is why the fall animation staggers its floaters.
 
-Not done yet: no audio and no hand-designed levels (boards are random).
+## Sound
+
+Four one-shot effects, one per channel, so none of them can cut another off: a falling "pew" on
+CH1 when a bubble is fired, a tick on CH2 when it bounces off a wall, a hiss on CH4 when a group
+pops, and a low beep on CH3 as the ceiling drop telegraphs itself one shot early. No driver, no
+timer, no note data — each effect is a few writes to the sound registers, and the hardware plays
+the rest, so the frame loop never waits for audio. `audio.c` holds the module and its calibration
+knobs.
+
+Not done yet: no music, and no hand-designed levels (boards are random).

@@ -714,12 +714,179 @@ def strip_visible(py):
     return bool((screen[136:144, 96:136, 0] < 200).any())
 
 
+# --- audio ---
+NR50_REG, NR51_REG, NR52_REG = 0xFF24, 0xFF25, 0xFF26
+CH_FIRE, CH_BOUNCE, CH_WARN, CH_POP = 0x01, 0x02, 0x04, 0x08   # NR52 bits 0-3
+# audio_init()'s signature: AUDIO_MASTER and AUDIO_PAN, from audio.c. Nothing else
+# in the ROM writes either one to these values.
+AUDIO_MASTER, AUDIO_PAN = 0x77, 0xFF
+
+
+def check_audio(rom):
+    """The four SFX have to actually reach the APU, on the right channels.
+
+    This needs its own PyBoy with sound_emulated=True: every other check here runs
+    with sound_emulated=False, where PyBoy returns 0 from every sound register and
+    DISCARDS every write, so audio is simply not observable in that instance --
+    measured, not assumed. Sound emulation also needs no audio device, which is why
+    this works headlessly.
+
+    Two rules, both measured on this toolchain:
+
+      * Assert on NR52's per-channel bits (0-3 = CH1-4 running). NRx3/NRx4 are
+        write-only on a DMG and read back 0xFF, so they cannot be asserted on.
+      * Gate on something THIS GAME wrote, never on "a channel is on". The DMG boot
+        ROM drives CH1/CH2 itself for the first ~65 frames, so a check that waits
+        for any channel to be active passes before main() has run a line of game
+        code -- the same shape of mistake as the title-screen arch that fooled
+        check_drop_keeps_colours(). NR50 == 0x77 alone is NOT enough either: the
+        boot ROM sets exactly that for its jingle. NR51 is what separates them, as
+        the boot ROM writes 0xF3 there and audio_init() writes 0xFF.
+
+    Teeth come from what the checks would miss: a shot with no sfx_fire() leaves
+    CH1 silent, a wall bounce with no sfx_bounce() leaves CH2 silent, a pop with no
+    sfx_pop() leaves CH4 silent, and a drop warned at the instant it lands -- the
+    off-by-one in sfx_warn()'s call site -- leaves no gap between the CH3 burst and
+    the slide, which is what the gap assertion below measures.
+    """
+    py = PyBoy(rom, window="null", sound_emulated=True)
+
+    def tick(n, key=None):
+        for _ in range(n):
+            if key:
+                py.button_press(key)
+            py.tick(1, True)
+            if key:
+                py.button_release(key)
+
+    def channels():
+        return py.memory[NR52_REG] & 0x0F
+
+    for _ in range(400):
+        py.tick(1, True)
+        if py.memory[NR50_REG] == AUDIO_MASTER and py.memory[NR51_REG] == AUDIO_PAN:
+            break
+    else:
+        raise AssertionError(
+            "the game never initialised the APU: NR50/NR51 never took audio_init()'s "
+            "values after 400 frames (NR50=0x%02X NR51=0x%02X, want 0x%02X/0x%02X)"
+            % (py.memory[NR50_REG], py.memory[NR51_REG], AUDIO_MASTER, AUDIO_PAN))
+
+    # Past the boot ROM's own jingle, at the title. is_title() is the exact signal
+    # and worth waiting for: main() runs audio_init() and then draws the title, and
+    # a START pressed into the gap between the two is simply not read.
+    for _ in range(600):
+        py.tick(1, True)
+        if is_title(py):
+            break
+    else:
+        raise AssertionError("the title screen never came up: cannot reach a board")
+    tick(3, "start")
+    for _ in range(300):
+        py.tick(1, True)
+        if all(py.memory[0xFE01 + s * 4] for s in (4, 5, 6)):
+            break
+    else:
+        raise AssertionError("the aim dots never appeared: no board was started")
+
+    # Nothing fires while the player is only aiming. audio_init() leaves a powered
+    # APU with every channel idle, and nothing in the aim loop triggers one.
+    assert not channels(), \
+        "channel(s) %s are running while the player is only aiming: something " \
+        "triggers an SFX that should not" % format(channels(), "04b")
+
+    # Steer the sweep to its far right stop -- 15 degrees, nearly horizontal -- so
+    # the shot reaches the right wall within ~15 frames, before it can hit anything.
+    # The default aim is dead vertical and would never touch a wall at all. The sweep
+    # does not wrap (LEFT/RIGHT clamp at the ends), so holding it is free: the aim
+    # key repeat is one step per 3 frames, and 60 of them is more than the 8 steps
+    # between the vertical and the stop.
+    tick(60, "right")
+    tick(1, "a")
+    fire, bounce = False, False
+    for _ in range(40):
+        py.tick(1, True)
+        n = channels()
+        fire |= bool(n & CH_FIRE)
+        bounce |= bool(n & CH_BOUNCE)
+    assert fire, "firing a shot did not start CH1: sfx_fire() is not wired to the aim break"
+    assert bounce, "the shot bounced off a wall without starting CH2: sfx_bounce() is " \
+                   "not wired to the wall reflection"
+
+    # The ceiling drop's telegraph. It needs a shot count to build up (a drop comes
+    # every drop_every shots -- 8 at level 0), so this is blind play until one has
+    # slid the board and settled.
+    #
+    # `warned` deliberately OUTLIVES the shot it was heard in: the whole point of the
+    # warning is that it belongs to the shot BEFORE the drop, so it is always in the
+    # previous shot's window. The gap is measured from the burst to the drop's FIRST
+    # slid frame, which is what makes the off-by-one sign-flip: warning on the drop's
+    # own frame means the CH3 burst is still sounding when the slide starts and the
+    # gap comes out negative. Measured to the settle instead it would come out merely
+    # small -- the burst and the 16-frame slide overlap either way -- and a warn-now
+    # implementation would pass it.
+    warned, gaps, frame = None, [], 0
+    for _ in range(24):
+        tick(6, "left")
+        tick(3, "a")
+        slide, slid, prev, n = None, False, None, 0
+        while n < 160:
+            py.tick(1, True)
+            frame += 1
+            n += 1
+            if channels() & CH_WARN:
+                warned = frame
+            scy = py.memory[SCY_REG]
+            if scy % 8:
+                slid = True            # mid-slide: the drop is happening now
+                if slide is None:
+                    slide = frame
+            elif slid and scy and scy == prev:
+                assert warned is not None, \
+                    "a ceiling drop at frame %d was never warned: sfx_warn() is not " \
+                    "wired to the shot before the drop" % slide
+                gaps.append(slide - warned)
+                break
+            prev = scy
+        if gaps:
+            break
+
+    assert gaps, "no ceiling drop within 24 shots: the drop warning is untested"
+    assert gaps[0] >= 10, \
+        "the drop warning sounded %d frames before the drop started (%s): it has to " \
+        "be a whole shot earlier, not at the instant the player is punished" % (
+            gaps[0], "still sounding when the slide began" if gaps[0] <= 0 else "too close")
+
+    # A pop. Which shot lands a match is not predictable, so fire until one does --
+    # the same shape as the score loop in main().
+    pop = False
+    for _ in range(30):
+        if pop:
+            break
+        tick(6, "left")
+        tick(3, "a")
+        for _ in range(90):
+            py.tick(1, True)
+            if channels() & CH_POP:
+                pop = True
+        # Harmless during play; restarts the game if the board filled up.
+        tick(1, "start")
+    assert pop, "no pop within 30 shots started CH4: sfx_pop() is not wired to resolve()"
+
+    py.stop(save=False)
+    return "fire/bounce/pop/warn(+%df)" % gaps[0]
+
+
 def main():
     rom = sys.argv[1] if len(sys.argv) > 1 else "bubble.gb"
     border = check_border_data()
     check_sgb_header(rom)
     check_font_order()
     ramp = check_difficulty()
+    # Its own console, and so its own PyBoy: the one below runs with
+    # sound_emulated=False, where every sound register reads 0 and every write is
+    # thrown away. Run before that instance exists rather than alongside it.
+    audio = check_audio(rom)
     py = PyBoy(rom, window="null", sound_emulated=False)
 
     def frames(n, key=None):
@@ -887,9 +1054,9 @@ def main():
     # this to happen on its own, so the state is forced.
     check_drop_keeps_colours(py, frames)
 
-    print("ok: sgb_border=%s walls=%d ramp=%s after_shot=%d counts=%s score=%d "
+    print("ok: sgb_border=%s walls=%d ramp=%s audio=%s after_shot=%d counts=%s score=%d "
           "drop_scy=%d mid=%d game_over->title=%d frames (A: %d)"
-          % (border, walls, ramp, after_shot, sorted(seen), final_score, max(settled),
+          % (border, walls, ramp, audio, after_shot, sorted(seen), final_score, max(settled),
              len(mid), gap, skip))
     py.stop(save=False)
 

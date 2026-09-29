@@ -25,6 +25,7 @@
 #include <stdint.h>
 #include <string.h>
 
+#include "audio.h"
 #include "border_data.h"
 #include "sgb_border.h"
 
@@ -418,6 +419,13 @@ static uint8_t resolve(uint8_t r, uint8_t c)
     uint8_t i, idx, extra;
     if (n < MIN_MATCH) return 0;
 
+    /* Once per resolve, not once per bubble. The loop below already vsync()s a
+     * frame a bubble as the pop animation, and retriggering CH4 on each of those
+     * frames is not n pops on hardware -- the channel never finishes a burst, so
+     * it is one long hiss. The early return above is why a landing that matches
+     * nothing is silent. */
+    sfx_pop();
+
     for (i = 0; i < n; i++) {
         idx = cluster[i];
         board[idx >> 3][idx & 7] = 0;
@@ -606,7 +614,11 @@ static uint8_t play(void)
                 move_sprite(SPR_DOT + i, (uint8_t)(px + 4), (uint8_t)(py + 12));
             }
 
-            if ((keys & (J_A | J_B)) && !(prev & (J_A | J_B))) { prev = keys; break; }
+            if ((keys & (J_A | J_B)) && !(prev & (J_A | J_B))) {
+                prev = keys;
+                sfx_fire();
+                break;
+            }
             prev = keys;
         }
 
@@ -624,8 +636,10 @@ static uint8_t play(void)
             fx += fdx;
             fy += fdy;
 
-            if (fx < WALL_L * 16)      { fx = WALL_L * 32 - fx; fdx = -fdx; }
-            else if (fx > WALL_R * 16) { fx = WALL_R * 32 - fx; fdx = -fdx; }
+            /* The two reflection cases are the only wall bounce in the flight
+             * step, so CH2 ticks here and nowhere else. */
+            if (fx < WALL_L * 16)      { fx = WALL_L * 32 - fx; fdx = -fdx; sfx_bounce(); }
+            else if (fx > WALL_R * 16) { fx = WALL_R * 32 - fx; fdx = -fdx; sfx_bounce(); }
 
             cx = fx >> 4;
             if (fy < 8 * 16) { cy = 8; hit = 1; }         /* ceiling */
@@ -648,7 +662,15 @@ static uint8_t play(void)
          * row and un-clears it. */
         if (!colour_mask()) return 1;
 
+        /* A drop telegraph, and it has to come one shot EARLY to be one: the drop
+         * happens on the shot that brings `shots` up to drop_every, so the shot to
+         * warn on is the one before it -- the shot after which shots is still
+         * drop_every - 1. Warning from inside the drop's own branch would beep at
+         * the exact instant the player is punished and warn them of nothing.
+         * Cast at the comparison: uint8_t against the promoted int is SDCC warning
+         * 185, and this builds with zero warnings. */
         if (++shots >= drop_every) { shots = 0; ceiling_drop(); }
+        else if ((uint8_t)(shots + 1) == drop_every) sfx_warn();
 
         if (bottom_reached()) return 0;
 
@@ -989,6 +1011,12 @@ void main(void)
         load_tiles();
         blank_maps();
     }
+
+    /* Sound, once, after the border. set_sgb_border() trashes VRAM to get its
+     * payload on screen, and the APU has no business being set up before that
+     * has finished with the machine. Not per board, not per frame: audio_init()
+     * powers the APU off and on again, which would cut off anything playing. */
+    audio_init();
 
     /* A game is titles -> boards until it is lost -> back to the title, forever.
      * Losing ends the game; clearing a board only advances the level. */
