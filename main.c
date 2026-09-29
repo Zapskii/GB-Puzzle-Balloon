@@ -740,6 +740,28 @@ static uint16_t title_screen(void)
     return waited;
 }
 
+/* Game over holds the finished board for about five seconds -- 300 frames at
+ * roughly 60Hz -- before the title comes back. A or B (or START) cuts it short. */
+#define GAME_OVER_FLASH   6              /* flashes, 16 frames each */
+#define GAME_OVER_HOLD    204            /* the rest of the 5s: 6*16 + 204 = 300 */
+
+/* Wait out the finished board, but let A or B skip it: whoever just lost knows it
+ * and five seconds is a long time to stare at a board that will not change. START
+ * too, since it is what carries on from the title anyway.
+ *
+ * The button that fired the losing shot may still be down, and a held button must
+ * not read as a skip -- hence the release first. The release at the end is so a
+ * held button does not fall straight through the title screen that follows. */
+static void wait_or_skip(uint16_t frames)
+{
+    waitpadup();
+    while (frames--) {
+        vsync();
+        if (joypad() & (J_A | J_B | J_START)) break;
+    }
+    waitpadup();
+}
+
 void main(void)
 {
     uint8_t won;
@@ -769,22 +791,32 @@ void main(void)
     SHOW_SPRITES;
     DISPLAY_ON;
 
-    /* Title screen; how long the player took to press START seeds the RNG, the
-     * DMG having no timer to sample. */
-    initrand(title_screen());
-
-    level = 0;
+    /* A game is titles -> boards until it is lost -> back to the title, forever.
+     * Losing ends the game; clearing a board only advances the level. */
     for (;;) {
-        init_board((uint8_t)(4 + (level > 2 ? 2 : level)));
-        redraw_all();
-        won = play();
-        hide_all_sprites();
+        /* How long the player took to press START seeds the RNG, the DMG having
+         * no timer to sample. */
+        initrand(title_screen());
+        level = 0;
+        score  = 0;
 
-        if (won) { level++; flash(3); }
-        else     { level = 0; score = 0; flash(6); }
+        for (;;) {
+            init_board((uint8_t)(4 + (level > 2 ? 2 : level)));
+            redraw_all();
+            won = play();
+            hide_all_sprites();
 
-        /* TODO: show "STAGE CLEAR" / "GAME OVER" (needs a font tileset) */
-        waitpad(J_START);
-        waitpadup();
+            if (!won) break;             /* game over */
+
+            level++;
+            flash(3);
+            waitpad(J_START);            /* START carries on to the next board */
+            waitpadup();
+        }
+
+        flash(GAME_OVER_FLASH);
+        wait_or_skip(GAME_OVER_HOLD);
+
+        /* TODO: show "STAGE CLEAR" / "GAME OVER" (needs more glyphs) */
     }
 }

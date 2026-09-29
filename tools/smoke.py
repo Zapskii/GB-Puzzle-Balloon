@@ -93,6 +93,49 @@ def bubble_tiles(py):
                if 2 <= tile(py, c, r) <= 17)
 
 
+def is_title(py):
+    """True when every one of the 20x18 tiles matches the title screen."""
+    want = expected_title_map()
+    return all(tile(py, c, r) == want[r][c] for r in range(18) for c in range(20))
+
+
+def game_over_to_title(py, frames, shot_budget=60, skip=False):
+    """Play until the game is lost; return frames from then to the title screen.
+
+    Game over is the frame every used sprite goes hidden -- main() calls
+    hide_all_sprites() as play() returns. Returns None if no game over happened
+    within the budget, and -1 if one did but the title never came back. Shots are
+    fired blind, which loses reliably; clearing a board just moves on a level.
+
+    With skip=True, tap A once the game is over, which should cut the hold short
+    instead of waiting it out.
+    """
+    if is_title(py):                    # START is what leaves the title screen
+        frames(3, "start")
+        frames(60)
+
+    over = None
+    n = 0
+    for _ in range(shot_budget):
+        frames(5, "left")
+        frames(3, "a")
+        for _ in range(400):
+            py.tick(1, True)
+            n += 1
+            if is_title(py):
+                return -1 if over is None else n - over
+            if over is None and all(py.memory[0xFE00 + s * 4] == 0 for s in range(7)):
+                over = n                # launcher, next bubble and aim dots all gone
+            if skip and over is not None and n - over == 130:
+                # ~1.5s in: past the 96-frame game-over flash, which does not read
+                # the pad, and well inside the hold that follows. A tap, not a hold,
+                # so it reads as a fresh press.
+                frames(1, "a")
+                py.tick(1, True)
+                n += 1
+    return -1 if over is not None else None
+
+
 def wall_count(py):
     return sum(1 for r in range(18) for c in (0, 1, 18, 19)
                if tile(py, c, r) == 1)
@@ -251,7 +294,21 @@ def main():
     assert score(py), "score never moved"
     final_score = score(py)            # the strip is blank again once the title is back
 
-    print("ok: walls=%d start_tiles=%d counts=%s" % (walls, start, sorted(seen)))
+    # Game over must hand back to the title screen by itself, and must not leave
+    # the finished game's score hanging over it (is_title() covers the strip).
+    gap = game_over_to_title(py, frames)
+    assert gap is not None, "no game over within 60 shots, so the title return is untested"
+    assert gap > 0, "the game ended but the title screen never came back"
+    assert 280 <= gap <= 380, \
+        "title came back %d frames after game over, expected ~300 (5s)" % gap
+
+    # A or B during the hold goes straight to the title instead of waiting it out.
+    skip = game_over_to_title(py, frames, skip=True)
+    assert skip is not None and 0 < skip < 280, \
+        "A did not cut the game-over hold short (%s frames)" % skip
+
+    print("ok: walls=%d start_tiles=%d counts=%s score=%d game_over->title=%d frames (A: %d)"
+          % (walls, start, sorted(seen), final_score, gap, skip))
     py.stop(save=False)
 
 
