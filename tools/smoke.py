@@ -1067,6 +1067,12 @@ T_BURST = 48                     # main.c's T_BURST: 4 tiles, one 2x2 cell
 BURST_TILES = range(T_BURST, T_BURST + 4)
 # The forced pop: the cells the burst has to land on -- see force() below.
 CLUSTER = ((1, 2), (1, 3), (1, 4), (2, 3))
+# The numbers the pop's beat and the combo landed with. main.c's own #defines are
+# read and asserted equal to these: a check that EXPECTED whatever main.c happens
+# to say would adapt to a build that changed them and never fail, which is how
+# POP_FRAMES = 60 passed here.
+WANT_POP_FRAMES = 6
+WANT_COMBO_MAX = 8
 
 
 def screen_cell(r, c, parity):
@@ -1089,31 +1095,75 @@ def burst_tiles(py):
 def check_pop_and_combo(rom):
     """A popped cluster has to be marked before it goes, and pops in a row have to pay more.
 
-    Three claims, all measured on a board this check forces, because which shot
-    pops is not predictable in ordinary play:
+    Everything here is measured on a board this check forces, because which shot
+    pops is not predictable in ordinary play. Five claims:
 
       * **The burst.** Every cell of the cluster turns into a burst tile for a few
         frames (main.c's POP_FRAMES) before any of it is erased. Asserted as an
         exact tile set -- the burst has to cover all four cells of the forced
-        cluster and nothing else, which pins both the beat and the cell it is
-        drawn on. An instant erase leaves this set empty.
+        cluster and nothing else, which pins both the beat and the cell it is drawn
+        on. An instant erase leaves this set empty.
 
-      * **The combo.** Four shots that each pop four bubbles, one after another.
-        The score gain has to rise by a constant positive step, which is what
-        says the multiplier is the run length and not flat and not doubling.
+      * **Its duration.** The full 4-cell set is counted frame by frame and has to
+        be up for POP_FRAMES - 1 of them. The -1 is measured, not a fudge: the
+        erase loop's first cell goes in the same frame the last of
+        wait_frames(POP_FRAMES)' vsyncs returns in, so that frame is already
+        partial by the time this can sample it (measured 2/5/9 full frames at
+        POP_FRAMES 3/6/10, i.e. POP_FRAMES - 1 every time), and the partial frames
+        after it are not counted. WANT_POP_FRAMES pins the number itself, because a
+        build that raised POP_FRAMES would otherwise just be sampled for longer and
+        still agree with itself.
+
+      * **The combo, and the cap from both sides.** COMBO_MAX + 2 shots that each
+        pop four bubbles, one after another. The first COMBO_MAX gains have to rise
+        by a constant positive step -- which is what says the multiplier is the run
+        length and not flat and not doubling -- and the gains then have to PLATEAU:
+        the three from COMBO_MAX on are equal. That is the cap from below (a run
+        that keeps climbing is uncapped, main.c's `combo++` with the
+        `if (combo < COMBO_MAX)` test dropped) and from above, since the cap has to
+        be reached INSIDE the two extra shots (COMBO_MAX raised past the window
+        never plateaus at all). The plateau's value has to be COMBO_MAX x the
+        single-shot award, so a cap that is hit early fails on the position as well
+        as on the value.
+
+      * **A dud shot ends the run.** With the run at the cap, a forced shot that
+        matches NOTHING -- force(pop=False): rows 1-7 empty and row 0 a row of a
+        colour the launcher is not holding, so the bubble lands in row 1 beside a
+        different colour -- has to pay exactly 0, and the pop after it has to be
+        worth the single-shot base again, then twice it. That is main.c's
+        `combo = 0` in resolve()'s early return: without it the cap survives a shot
+        that popped nothing and the next pop pays COMBO_MAX times the base.
 
       * **No wrap.** The score is a uint16_t shown as five digits. Sampled at every
         pop and asserted non-decreasing -- a wrapped total reads as a drop -- and
-        then forced, in RAM, to 65520 immediately before a pop: the field must
-        read 65535 afterwards. A build that lets the total wrap reads 24 there.
-        That is main.c's add_score() clamp, and forcing the score is the only way
-        to reach it headlessly: an honest smoke run is nowhere near 65535.
+        then forced, in RAM, to 65520 immediately before a pop: the field must read
+        65535 afterwards. A build that lets the total wrap reads a few hundred
+        there. That is main.c's add_score() clamp, and forcing the score is the only
+        way to reach it headlessly: an honest smoke run is nowhere near 65535.
 
-    WHAT THIS DOES NOT COVER. The award arithmetic itself: the bound that makes one
-    pop's points fit a uint16_t at COMBO_MAX is a property of main.c's constants,
-    not of anything observable here (a full board at COMBO_MAX is 15360 of 65535,
-    so no amount of play reaches it). The clamp is only reachable because the score
-    is forced into RAM. And nothing here hears the pop: sfx_pop() is check_audio()'s.
+    WHAT THIS DOES NOT COVER.
+
+      * **The per-board half of the reset**: main.c's `combo = 0` at the top of
+        play(). The run has to start again at 1 on a new board, and nothing here
+        says so -- a second board is the only thing that can tell, and reaching one
+        means clearing a board or losing one. It is a named gap rather than a
+        covered claim because the first board's combo starts at 0 in main.c's BSS
+        whether the line is there or not, so on one board the two builds are
+        identical: a check that claimed this would be measuring nothing. (The
+        recipe, if it is ever wanted: force a board that the next pop EMPTIES, so
+        the win screen and START lead to the next board, then force a pop there and
+        assert it pays the base again. The forced board makes that route
+        deterministic, but it is a second game state to drive, so it is not done
+        here.)
+
+      * **The award arithmetic itself.** The bound that makes one pop's points fit
+        a uint16_t at COMBO_MAX is a property of main.c's constants, not of
+        anything observable here: the board holds 60 bubbles (8 and 7 columns over
+        8 rows), so the most one pop can pay is a three-bubble match with the other
+        57 left floating -- 3*10 + 57*20 = 1170 -- which at COMBO_MAX 8 is 9360 of
+        65535. The clamp is only reachable because the score is forced into RAM.
+
+      * **The sound.** Nothing here hears the pop: sfx_pop() is check_audio()'s.
 
     Its own PyBoy, like check_audio(), and for the same kind of reason plus one
     more: it rewrites the board and the score in RAM, which leaves the machine in a
@@ -1121,6 +1171,19 @@ def check_pop_and_combo(rom):
     board_match() needs -- it locates board[] by matching it against the screen, and
     after this check has forced one the two no longer agree.
     """
+    src = open(os.path.join(HERE, os.pardir, "main.c")).read()
+
+    def define(name):
+        m = re.search(r"#define\s+%s\s+(\d+)" % name, src)
+        assert m, "main.c has no `#define %s`: update this check" % name
+        return int(m.group(1))
+
+    # Read out of main.c to be named in the messages, and checked against the
+    # values the feature landed with rather than against themselves: a build that
+    # moved POP_FRAMES or COMBO_MAX would otherwise just be sampled for longer, or
+    # plateaued later, and agree with itself (POP_FRAMES = 60 passed here that way).
+    pop_frames, combo_max = define("POP_FRAMES"), define("COMBO_MAX")
+
     py = PyBoy(rom, window="null", sound_emulated=False)
 
     def frames(n, key=None):
@@ -1147,8 +1210,23 @@ def check_pop_and_combo(rom):
         raise AssertionError("the aim dots never appeared: no board was started")
 
     addr, parity = board_match(py)
+    scy = py.memory[SCY_REG]                # settled: only a ceiling drop moves it
 
-    def force():
+    def dots_up():
+        return all(py.memory[0xFE01 + s * 4] for s in (4, 5, 6))
+
+    def want_burst():
+        """The screen cells the burst has to cover, for the row shift in force().
+
+        SHIFTED(r) is (r ^ parity) & 1, and a ceiling drop flips `parity`, so this
+        is asked once per shot rather than once per check.
+        """
+        w = set()
+        for r, c in CLUSTER:
+            w |= screen_cell(r, c, parity)
+        return w
+
+    def force(pop=True):
         """Rewrite the board in RAM into the shape the next shot is sure to pop.
 
         Rows 2-7 empty, so the shot meets nothing on the way up; (1,2)-(1,4) in the
@@ -1162,104 +1240,214 @@ def check_pop_and_combo(rom):
         columns 3 and 4 in an unshifted one -- and which of those a row is depends
         on the parity. Covering 2, 3 and 4 makes the pop the same either way, and
         the screen cells above are computed for the parity that is really there.
+
+        pop=False leaves row 1 empty as well. The shot then lands in row 1 beside a
+        row of a colour it is not, matches nothing, and nothing floats: a dud, which
+        is what the combo's reset needs. It still lands and stays, and the check
+        reads it back out of row 1.
         """
         cur = py.memory[0xFE02] >> 2                    # the launcher's colour
         for a in range(64):
             py.memory[addr + a] = 0
-        for c in range(8 - ((0 ^ parity) & 1)):         # ROW_COLS(0)
+        for c in range(8 - (parity & 1)):               # ROW_COLS(0)
             py.memory[addr + c] = ((cur + 1) & 3) + 1   # ...a colour it is not
-        for c in (2, 3, 4):
-            py.memory[addr + 8 + c] = cur + 1
+        if pop:
+            for c in (2, 3, 4):
+                py.memory[addr + 8 + c] = cur + 1
         return cur
 
-    want_burst = set()
-    for r, c in CLUSTER:
-        want_burst |= screen_cell(r, c, parity)
+    def shot(pop=True):
+        """Force the board, fire, wait the shot out, and report what it did.
 
-    gains, seen_score, first_burst, first_colour = [], [], None, None
-    for shot in range(4):
-        cur = force()
+        The wait is for the aim dots to come back: play() hides them from the
+        moment a shot fires until the next aim loop, which is after the pop's
+        frames, the erase, the floaters and any ceiling drop. They have to be seen
+        to go first -- a dud draws no burst, so "a burst appeared" cannot be the
+        trigger for every shot.
+
+        A ceiling drop comes every 8 shots at level 1 and flips `parity`, so it is
+        tracked here from SCY, which only a drop moves: without that the shots
+        after the drop would look for the burst one tile to the left of where the
+        game draws it.
+        """
+        nonlocal parity, scy
+        cur = force(pop)
+        want = want_burst()
         before = score(py)
-        seen_score.append(before)
+        wram0 = bytes(py.memory[0xC000:0xE000])
         frames(3, "a")
-        burst = None
+        burst, full, gone = None, 0, False
         for _ in range(200):
             py.tick(1, True)
             t = burst_tiles(py)
             if t and burst is None:
-                burst = t                        # its first frame is the whole cluster
-            if burst and all(py.memory[0xFE01 + s * 4] for s in (4, 5, 6)):
-                break                            # the aim loop is back: the pop is done
-        assert burst, \
+                burst = t
+            if t == want:
+                full += 1                    # the whole cluster, not a cell of it
+            if not dots_up():
+                gone = True
+                continue
+            if gone:
+                break
+        assert gone, \
+            "a shot never handed the aim loop back: nothing popped, nothing landed, " \
+            "or the game left the board"
+        now = py.memory[SCY_REG]
+        if now != scy:                       # a ceiling drop: the row shift flipped
+            scy, parity = now, parity ^ 1
+        return dict(cur=cur, want=want, burst=burst, full=full, before=before,
+                    after=score(py), wram0=wram0, wram1=bytes(py.memory[0xC000:0xE000]))
+
+    # --- the run, out to the cap and past it ----------------------------------
+    # The cap the run is measured against is the one the feature landed with, not
+    # main.c's, which is only named in the failure messages: a cap taken from
+    # main.c would move the plateau with it and never fail.
+    cap = WANT_COMBO_MAX
+    gains, seen_score, fulls, first = [], [], [], None
+    for shot_i in range(cap + 2):
+        r = shot()
+        assert r["burst"], \
             "shot %d popped %d bubbles and none of them was drawn as a burst before " \
             "it went (no tiles %d-%d anywhere on the board): the pop still reads as " \
-            "an instant erase" % (shot, len(CLUSTER), T_BURST, T_BURST + 3)
-        if first_burst is None:
-            first_burst, first_colour = burst, cur
-        after = score(py)
-        seen_score.append(after)
-        assert before is not None and after is not None, \
+            "an instant erase" % (shot_i, len(CLUSTER), T_BURST, T_BURST + 3)
+        if first is None:
+            first = r
+        assert r["before"] is not None and r["after"] is not None, \
             "the score field stopped reading as SCORE + five digits during the pop " \
-            "(before %s, after %s)" % (before, after)
-        gains.append(after - before)
+            "(before %s, after %s)" % (r["before"], r["after"])
+        gains.append(r["after"] - r["before"])
+        seen_score += [r["before"], r["after"]]
+        fulls.append(r["full"])
 
     # The burst covers exactly the cells that are about to pop: the three forced
     # bubbles and the bubble this shot landed. Anything else would mean the beat is
     # not marking what it says it is marking.
-    assert first_burst == want_burst, \
-        "the burst covered %s, not the %d cells of the popped cluster (%s, colour %d): " \
-        "something other than the matched bubbles is being marked" % (
-            sorted(first_burst), len(CLUSTER), sorted(want_burst), first_colour)
+    assert first["burst"] == first["want"], \
+        "the burst covered %s, not the %d cells of the popped cluster (%s, colour " \
+        "%d): something other than the matched bubbles is being marked" % (
+            sorted(first["burst"] or ()), len(CLUSTER), sorted(first["want"]),
+            first["cur"])
 
-    # Four pops of four bubbles, back to back. Flat scoring pays the same for each;
-    # a multiplier equal to the run length pays 40, 80, 120, 160 -- so the step has
-    # to be constant and positive, which is also what rules out a doubling scheme.
-    steps = [gains[i + 1] - gains[i] for i in range(len(gains) - 1)]
+    # ...and it stays up for the beat, not for a frame and not for the rest of the
+    # board: POP_FRAMES - 1 full frames per pop, the value the beat landed with
+    # (main.c's own POP_FRAMES is in the message because a build that moved it
+    # would be sampled for longer and still agree with itself).
+    assert set(fulls) == {WANT_POP_FRAMES - 1}, \
+        "the full %d-cell burst was up for %s frame(s) per pop, and main.c's " \
+        "POP_FRAMES is %d: it has to be the %d frames the beat landed with (the " \
+        "erase loop then takes the cells a frame each, and those partial frames " \
+        "are not counted)" % (
+            len(first["want"]) // 4, sorted(set(fulls)), pop_frames,
+            WANT_POP_FRAMES - 1)
+
+    # COMBO_MAX + 2 pops of four bubbles, back to back. Flat scoring pays the same
+    # for each; an uncapped run never stops climbing; a multiplier equal to the run
+    # length pays 40, 80, ... and then holds at the cap.
     assert all(g > 0 for g in gains), \
         "a forced shot into a ready-made cluster paid nothing: gains %s (the board " \
         "was forced but the shot did not pop it)" % gains
+
+    steps = [gains[i + 1] - gains[i] for i in range(cap - 1)]
     assert len(set(steps)) == 1 and steps[0] > 0, \
-        "four forced pops of the same four bubbles paid %s: the same pop is worth " \
-        "%s every time, so consecutive pops are not worth more" % (
-            gains, "the same" if gains.count(gains[0]) == len(gains) else "not")
+        "the first %d forced pops of the same four bubbles paid %s, and main.c's " \
+        "COMBO_MAX is %d: the step from one pop to the next over those %d pops is " \
+        "%s, and it has to be the same positive number every time -- that is what " \
+        "says the multiplier is the run length, where flat scoring steps by 0 and a " \
+        "doubling scheme widens (a step that falls to 0 early is the cap being " \
+        "reached early)" % (cap, gains[:cap], combo_max, cap, sorted(set(steps)))
+
+    plateau = gains[cap - 1:cap + 2]
+    assert plateau[0] == plateau[1] == plateau[2], \
+        "main.c's COMBO_MAX is %d, and %d pops in a row paid %s: the run is at the " \
+        "cap by the %dth pop, so from there the award has to stop climbing and the " \
+        "last three gains have to be equal -- they are %s, so it is still climbing " \
+        "(or the cap is further out than this window is long)" % (
+            combo_max, cap + 2, gains, cap, plateau)
+    assert plateau[0] == gains[0] * cap, \
+        "the award stopped climbing at %d, not %d x the single-shot %d = %d: the cap " \
+        "is being reached at the wrong run length" % (
+            plateau[0], gains[0], cap, gains[0] * cap)
 
     assert seen_score == sorted(seen_score), \
         "the score went down during play: %s (escalating points wrapped the uint16_t " \
         "and the five-digit field is lying)" % seen_score
 
-    # And the clamp, at the top. The displayed total is the only handle on main.c's
-    # `score` (the linker map lists no statics, so there is no symbol for it), and
-    # the score is a 16-bit little-endian value in WRAM: find the pair. The board's
-    # own 64 bytes are excluded -- its cells are 0..4 and could hold the same pair.
-    top = score(py)
-    hits = [a for a in range(0xC000, 0xE000 - 1)
-            if py.memory[a] == (top & 0xFF) and py.memory[a + 1] == (top >> 8)
-            and not addr <= a < addr + 64]
+    # --- a dud shot ends the run (resolve()'s `combo = 0` early return) -------
+    # The run is at the cap, so a build that keeps the multiplier across a shot that
+    # popped nothing is worth COMBO_MAX times the base on the next pop and is caught
+    # there; one that pays for the dud at all is caught here.
+    dud = shot(pop=False)
+    assert dud["before"] is not None and dud["after"] is not None, \
+        "the score field stopped reading as SCORE + five digits over the dud shot " \
+        "(before %s, after %s)" % (dud["before"], dud["after"])
+    assert dud["after"] - dud["before"] == 0, \
+        "a shot that popped nothing paid %d points (%s -> %s), and it has to pay " \
+        "exactly nothing: only a pop can pay" % (
+            dud["after"] - dud["before"], dud["before"], dud["after"])
+    landed = [c for c in (2, 3, 4) if py.memory[addr + 8 + c] == dud["cur"] + 1]
+    assert landed, \
+        "the dud shot's bubble is not in row 1 (cols 2-4 hold %s and the launcher " \
+        "was holding colour %d): the shot did not land where this check put it, so " \
+        "it proves nothing about a dud" % (
+            [py.memory[addr + 8 + c] for c in (2, 3, 4)], dud["cur"])
+
+    again = shot()
+    assert again["after"] - again["before"] == gains[0], \
+        "the pop after a dud paid %d, not the single-shot base %d: the run was at " \
+        "the cap %d before the dud, so this is the multiplier surviving a shot that " \
+        "popped nothing" % (
+            again["after"] - again["before"], gains[0], plateau[0])
+    second = shot()
+    assert second["after"] - second["before"] == gains[0] * 2, \
+        "the second pop after a dud paid %d, not twice the single-shot base %d: the " \
+        "run did not restart at 1" % (second["after"] - second["before"], gains[0])
+
+    # --- the clamp, at the top -------------------------------------------------
+    # The displayed total is the only handle on main.c's `score` (the linker map
+    # lists no statics, so there is no symbol for it), and the score is a 16-bit
+    # little-endian value in WRAM. Looking for the displayed number alone is not
+    # enough -- two unrelated words can hold it, and the check then fails with a
+    # message about a score that is fine. What is unique is the pair of
+    # TRANSITIONS: the word that went from the old displayed total to the new one
+    # across a pop, twice over, on two pops of different sizes. The board's own 64
+    # bytes are excluded -- its cells are 0..4 and could hold the same pair.
+    def transitions(r):
+        b, a = r["wram0"], r["wram1"]
+        old, new = r["before"], r["after"]
+        return {i for i in range(0xE000 - 0xC000 - 1)
+                if b[i] == (old & 0xFF) and b[i + 1] == (old >> 8)
+                and a[i] == (new & 0xFF) and a[i + 1] == (new >> 8)
+                and not (addr <= 0xC000 + i < addr + 64)
+                and not (addr <= 0xC000 + i + 1 < addr + 64)}
+
+    hits = transitions(again) & transitions(second)
     assert len(hits) == 1, \
-        "found %d WRAM words holding the displayed score %d, expected exactly 1: " \
-        "cannot force the score to the top" % (len(hits), top)
-    py.memory[hits[0]] = 0xF0                    # 65520: any pop at all overflows
-    py.memory[hits[0] + 1] = 0xFF
-    force()
-    frames(3, "a")
-    got = None
-    for _ in range(200):
-        py.tick(1, True)
-        v = score(py)
-        if v is not None and v != top:
-            got = v
-            break
-    assert got is not None, \
+        "found %d WRAM words that went from the displayed score to the next one " \
+        "over both %s -> %s and %s -> %s, expected exactly 1: cannot force the " \
+        "score to the top" % (len(hits), again["before"], again["after"],
+                              second["before"], second["after"])
+
+    top = score(py)
+    word = 0xC000 + hits.pop()
+    py.memory[word] = 0xF0                  # 65520: any pop at all overflows
+    py.memory[word + 1] = 0xFF
+    over = shot()
+    assert over["before"] == top, \
+        "the displayed score moved from %d to %s before the forced shot: cannot " \
+        "tell what the clamp did" % (top, over["before"])
+    assert over["after"] != top, \
         "the score never moved away from %d: the forced shot did not pop" % top
-    assert got == 65535, \
+    assert over["after"] == 65535, \
         "the score was 65520 and one more pop of the same four bubbles pushed it " \
         "over the top, and the field reads %d: the award wrapped the uint16_t " \
         "instead of stopping at 65535, so the display is showing a number the " \
-        "player has not earned" % got
+        "player has not earned" % over["after"]
 
     py.stop(save=False)
-    return "burst=%d cells combo=%s clamp=%d" % (
-        len(first_burst) // 4, "->".join(str(g) for g in gains), got)
+    return "burst=%d cells for %d frames combo=%s dud=%d,%d,%d clamp=%d" % (
+        len(first["want"]) // 4, pop_frames - 1, "->".join(str(g) for g in gains),
+        dud["after"] - dud["before"], again["after"] - again["before"],
+        second["after"] - second["before"], over["after"])
 
 
 def main():

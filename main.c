@@ -519,8 +519,11 @@ static uint8_t drop_floating(void)
  * five digits, so a wrapped total would display "00004" while the player has
  * 65000-odd points -- the display lying about the score, which is worse than the
  * score stopping. Escalating points made this reachable where flat ones never
- * did: a full board of 64 in one pop is 1920, so this takes a few hundred pops
- * at COMBO_MAX, and it is a ceiling rather than a crash either way. */
+ * did. The most ONE pop can pay still fits: the board holds 60 bubbles (8 and 7
+ * columns over 8 rows), the award is 10 a matched bubble plus 20 a floater, so
+ * the best case is a three-bubble match with the other 57 left floating --
+ * 3*10 + 57*20 = 1170, and at COMBO_MAX that is 9360 of 65535. So the clamp is a
+ * ceiling rather than a crash, and it takes dozens of those pops to reach it. */
 static void add_score(uint16_t pts)
 {
     uint16_t room = (uint16_t)(0xFFFFu - score);
@@ -545,10 +548,13 @@ static uint8_t resolve(uint8_t r, uint8_t c)
      * nothing is silent. */
     sfx_pop();
 
-    /* The beat: every bubble in the cluster bursts at once, for POP_FRAMES
-     * frames, before any of it goes. Drawn in one frame with no vsync between
-     * the cells, so the whole cluster flashes together -- the shape the player
-     * made -- rather than sweeping. The erase loop below is unchanged. */
+    /* The beat: every bubble in the cluster turns into a burst for POP_FRAMES
+     * frames, before any of it goes. One loop with no vsync between the cells --
+     * but that is not the same as landing in one frame. set_bkg_tiles() polls the
+     * STAT register per byte, so it writes at roughly a byte a scanline, about 38
+     * cells a frame: a four-cell pop is up well inside a frame, and a whole-board
+     * cluster crosses one or two, filling in from the end the loop started at.
+     * The erase loop below is unchanged. */
     for (i = 0; i < n; i++) {
         idx = cluster[i];
         draw_burst(idx >> 3, idx & 7);
