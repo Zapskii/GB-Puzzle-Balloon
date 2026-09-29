@@ -84,11 +84,19 @@ like the change not working.
 | START | continue to the next board after clearing one |
 | A / B / START | skip the pause after a game over |
 
-The default aim is straight up, and the sweep is symmetric about it.
+The aim dots follow the shot's real path, wall bounces included, and a marker shows the cell it
+will stick to — both come from the same code the shot itself runs, so the preview cannot disagree
+with the shot. The default aim is straight up, and the sweep is symmetric about it.
 
 ## Scoring and levels
 
-Each popped bubble is 10 points, and each stranded bubble that falls is 20.
+Each popped bubble is 10 points, and each stranded bubble that falls is 20. A pop also bursts on
+the spot for a moment before the bubbles go, so a hit reads as the shape you made.
+
+**Streaks pay more.** The multiplier is how many shots in a row have popped, capped at eight, so a
+run of pops on the same four bubbles pays 40, then 80, then 120, up to 320 a pop. A shot that pops
+nothing breaks the streak, and every new board starts it over. The score stops at 65535 rather than
+wrapping round — it will never show you a number you have not earned.
 
 Clearing a board advances the level: the next board starts a row deeper (four rows of bubbles at
 the start, five from level 2, never more than five), and the ceiling drops more often (every
@@ -112,6 +120,14 @@ of flashing it (SCY leaves 0, is caught mid-slide, the LCD stays on, and the new
 screen at the top when it settles), and a game over hands back to the title on time. It
 deliberately checks tile ids rather than the game's own variables, so it needs no symbol map
 and does not break every time a global is added.
+
+Two checks force a board rather than playing one, because blind play cannot reliably produce the
+state they need: the ceiling drop's colours, and the pop and its scoring. The pop check rewrites
+the board in RAM so the next shot is certain to pop four bubbles, then asserts the burst covers
+exactly those four cells and nothing else, that it stays up for the right number of frames, that
+ten pops in a row climb and then stop climbing at the cap, that a shot into a board it cannot
+match pays nothing and ends the streak, and that a score forced to 65520 reads 65535 after one
+more pop instead of wrapping.
 
 It also checks the difficulty curve's two numbers straight out of `main.c` (at least two free rows
 above the losing row at every level, and a ceiling drop no more often than every four shots), since
