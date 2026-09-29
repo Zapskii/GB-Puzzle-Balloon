@@ -44,6 +44,12 @@
 #define T_BLANK      0
 #define T_WALL       1
 #define T_BUBBLE     2            /* 16 tiles: colour c starts at 2 + c*4 */
+/* BG tiles 18..30: just the glyphs the title text needs. "PUZZLE BALLOON" and
+ * "PRESS START" between them use 12 letters and a space, so a full character set
+ * would be a lot of ROM for nothing. BG ids must stay below 128 whatever gets
+ * added here: LCDC bit 4 is 0, so >= 128 aliases into the sprite tiles. */
+#define T_FONT       18
+#define FONT_LEN     13
 
 /* Sprite tile ids (8x16 mode: bubble colour c at c*4) */
 #define S_DOT        16
@@ -505,9 +511,115 @@ static void flash(uint8_t times)
     }
 }
 
+/* ---------------- font ---------------- */
+/* Glyphs are 5x7, left-aligned in the top five bits; row 7 is blank so they sit
+ * on a baseline. Written as shapes rather than as tile bytes because a tile needs
+ * its two bit planes interleaved, and doing that in load_font() keeps the shapes
+ * legible here. Ink is colour 3, black against the blank background. */
+static const char FONT_ORDER[] = " ABELNOPRSTUZ";
+
+static const uint8_t FONT_GLYPHS[FONT_LEN][8] = {
+    { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 },   /* space */
+    { 0x70,0x88,0x88,0xF8,0x88,0x88,0x88,0x00 },   /* A */
+    { 0xF0,0x88,0x88,0xF0,0x88,0x88,0xF0,0x00 },   /* B */
+    { 0xF8,0x80,0x80,0xF0,0x80,0x80,0xF8,0x00 },   /* E */
+    { 0x80,0x80,0x80,0x80,0x80,0x80,0xF8,0x00 },   /* L */
+    { 0x88,0xC8,0xA8,0x98,0x88,0x88,0x88,0x00 },   /* N */
+    { 0x70,0x88,0x88,0x88,0x88,0x88,0x70,0x00 },   /* O */
+    { 0xF0,0x88,0x88,0xF0,0x80,0x80,0x80,0x00 },   /* P */
+    { 0xF0,0x88,0x88,0xF0,0xA0,0x90,0x88,0x00 },   /* R */
+    { 0x78,0x80,0x80,0x70,0x08,0x08,0xF0,0x00 },   /* S */
+    { 0xF8,0x20,0x20,0x20,0x20,0x20,0x20,0x00 },   /* T */
+    { 0x88,0x88,0x88,0x88,0x88,0x88,0x70,0x00 },   /* U */
+    { 0xF8,0x08,0x10,0x20,0x40,0x80,0xF8,0x00 },   /* Z */
+};
+
+static void load_font(void)
+{
+    uint8_t g, y, t[16];
+    for (g = 0; g < FONT_LEN; g++) {
+        for (y = 0; y < 8; y++) {
+            t[y * 2]     = FONT_GLYPHS[g][y];   /* low plane  */
+            t[y * 2 + 1] = FONT_GLYPHS[g][y];   /* high plane = colour 3 */
+        }
+        set_bkg_data((uint8_t)(T_FONT + g), 1, t);
+    }
+}
+
+static uint8_t font_tile(char ch)
+{
+    uint8_t i;
+    for (i = 0; i < FONT_LEN; i++)
+        if (FONT_ORDER[i] == ch) return (uint8_t)(T_FONT + i);
+    return T_FONT;                              /* anything else -> space */
+}
+
+/* Only safe while the display is off: it writes to VRAM directly. */
+static void draw_text(uint8_t col, uint8_t row, const char *s)
+{
+    uint8_t t;
+    while (*s) {
+        t = font_tile(*s++);
+        set_bkg_tiles(col++, row, 1, 1, &t);
+    }
+}
+
+/* ---------------- title screen ---------------- */
+/* Built from the bubble tiles that are already loaded: no new art, no font, no
+ * extra VRAM, and nothing that can drift out of sync with the bubble graphics.
+ * An arch of bubbles above the launcher reads as a board built up ready to play.
+ *
+ * How many bubbles each row holds and the column it starts at, so the pile tapers
+ * on BOTH sides instead of looking lopsided. The starts are what centre a row: an
+ * unshifted row of n is centred at (8-n)/2, a shifted row, which sits half a
+ * bubble further right, at (7-n)/2. */
+static const uint8_t TITLE_COUNT[6] = { 8, 7, 6, 5, 4, 3 };
+static const uint8_t TITLE_START[6] = { 0, 0, 1, 1, 2, 2 };
+
+/* Both centred in the 16 tile playfield between the walls (cols 2..17). */
+static const char TITLE_NAME[]   = "PUZZLE BALLOON";
+static const char TITLE_PROMPT[] = "PRESS START";
+
+/* Waits for START, and returns how many frames that took, for the RNG seed. */
+static uint16_t title_screen(void)
+{
+    uint8_t r, c, n;
+    uint16_t waited = 0;
+
+    parity = 0;
+    memset(board, 0, sizeof board);
+    for (r = 0; r < 6; r++) {
+        for (c = TITLE_START[r], n = (uint8_t)(TITLE_START[r] + TITLE_COUNT[r]);
+             c < n && c < ROW_COLS(r); c++)
+            board[r][c] = (uint8_t)(((r + c) & 3) + 1);   /* diagonal banding */
+    }
+
+    /* The text goes down inside the same display-off window as the board rather
+     * than after redraw_all(): draw_text writes VRAM directly, so it cannot run
+     * with the LCD on. */
+    DISPLAY_OFF;
+    draw_board();
+    draw_text(3, 12, TITLE_NAME);
+    draw_text(4, 14, TITLE_PROMPT);
+    DISPLAY_ON;
+
+    /* No font yet, so the prompt is the launcher bubble pulsing: with nothing to
+     * spell, a moving bubble says "this is interactive" more directly than text
+     * would anyway. */
+    for (;;) {
+        place_bubble_sprite(SPR_FLY,  (uint8_t)((waited & 8) ? 1 : 2),
+                            LAUNCH_X, LAUNCH_Y);
+        place_bubble_sprite(SPR_NEXT, 3, NEXT_X, NEXT_Y);
+        vsync();
+        if (joypad() & (J_START | J_A)) break;
+        waited++;
+    }
+    waitpadup();
+    return waited;
+}
+
 void main(void)
 {
-    uint16_t seed = 0;
     uint8_t won;
 
     DISPLAY_OFF;
@@ -522,6 +634,7 @@ void main(void)
     set_bkg_data(T_BUBBLE, 16, gfx);
     set_sprite_data(0, 16, gfx);
     set_sprite_data(S_DOT, 2, dot_gfx);
+    load_font();
 
     /* The boot ROM drew its Nintendo logo into the BG map and left it there,
      * so clear the screen before turning the LCD back on: otherwise the wait
@@ -530,19 +643,13 @@ void main(void)
     fill_bkg_rect(0, 0, 20, 18, T_BLANK);
 
     hide_all_sprites();
-    /* Show the launcher and the "next" bubble while waiting, so an empty board
-     * reads as "ready" rather than as a dead screen. Placeholder until there is
-     * a font and a real title screen. */
-    place_bubble_sprite(SPR_FLY,  1, LAUNCH_X, LAUNCH_Y);
-    place_bubble_sprite(SPR_NEXT, 2, NEXT_X,   NEXT_Y);
     SHOW_BKG;
     SHOW_SPRITES;
     DISPLAY_ON;
 
-    /* wait for START; time spent waiting seeds the RNG */
-    while (!(joypad() & (J_START | J_A))) { seed++; vsync(); }
-    waitpadup();
-    initrand(seed);
+    /* Title screen; how long the player took to press START seeds the RNG, the
+     * DMG having no timer to sample. */
+    initrand(title_screen());
 
     level = 0;
     for (;;) {
