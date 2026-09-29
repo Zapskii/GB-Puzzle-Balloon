@@ -172,8 +172,8 @@ sprites per scanline, which is why the fall animation staggers its floaters.
 ## Sound
 
 Four one-shot effects, one per channel, so none of them can cut another off: a falling "pew" on
-CH1 when a bubble is fired, a tick on CH2 when it bounces off a wall, a hiss on CH4 when a group
-pops, and a low beep on CH3 as the ceiling drop telegraphs itself one shot early. No driver, no
+CH1 when a bubble is fired, a tick on CH2 when it bounces off a wall, a low thump on CH4 when a
+group pops, and a low beep on CH3 as the ceiling drop telegraphs itself one shot early. No driver, no
 timer, no note data — each effect is a few writes to the sound registers, and the hardware plays
 the rest, so the frame loop never waits for audio. `audio.c` holds the module and its calibration
 knobs.
