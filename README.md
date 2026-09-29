@@ -1,4 +1,4 @@
-# BUBBLE — Puzzle Balloon
+# Puzzle Balloon
 
 A Puzzle Bobble / Bust-A-Move clone for the original Game Boy (DMG — four shades of
 grey), written in C with [GBDK-2020](https://github.com/gbdk-2020/gbdk-2020) (`lcc` /
@@ -11,14 +11,14 @@ bubbles reach the bottom row.
 
 Public repo: **<https://github.com/Zapskii/GB-Puzzle-Balloon>** — by Zapski.
 Latest release: **v1.0** — <https://github.com/Zapskii/GB-Puzzle-Balloon/releases/tag/v1.0>
-(the built `bubble.gb` is attached there, so you can skip the build entirely).
+(the built `Puzzle-Balloon.gb` is attached there, so you can skip the build entirely).
 
 ## Build
 
 ```sh
 git clone https://github.com/Zapskii/GB-Puzzle-Balloon.git
 cd GB-Puzzle-Balloon
-make            # produces bubble.gb
+make            # produces Puzzle-Balloon.gb
 make usage      # ROM/RAM headroom
 ```
 
@@ -40,7 +40,7 @@ make -C ../GB-Protector image    # only if the image is missing
 Any DMG emulator will do. mGBA, SameBoy and Emulicious all work:
 
 ```sh
-open -a mGBA bubble.gb
+open -a mGBA Puzzle-Balloon.gb
 ```
 
 Emulicious has the better debugger and VRAM viewer; mGBA is the quickest to just play.
@@ -62,7 +62,7 @@ never uploaded, and nothing else looks wrong. `make test` asserts both header by
 (`0x0146 = 0x03` with `0x014B = 0x33`), so losing the flag fails the test.
 
 To see it, run the ROM in an emulator with SGB support. mGBA autodetects from the header,
-so a plain `mgba bubble.gb` is enough; to force the model, `-C sgb.model=sgb` (or `sgb2`).
+so a plain `mgba Puzzle-Balloon.gb` is enough; to force the model, `-C sgb.model=sgb` (or `sgb2`).
 PyBoy cannot show it at all, as it does not emulate the SGB. To redraw or change the
 border art, edit `tools/mkborder.py`, then:
 

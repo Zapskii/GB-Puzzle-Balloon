@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""Headless smoke test for BUBBLE, run against the built ROM.
+"""Headless smoke test for Puzzle Balloon, run against the built ROM.
 
 WHY THIS EXISTS: a screenshot only tells you the screen is not blank. This boots
 the ROM in PyBoy, starts a game and fires shots, then asserts the board actually
 changed -- which is the difference between "main.c runs" and "main.c plays".
 
-    make test            # or: tools/smoke.py bubble.gb
+    make test            # or: tools/smoke.py Puzzle-Balloon.gb
 
 It reads the BG TILEMAP rather than the game's own variables on purpose: tile
 ids are a stable interface (0 blank, 1 wall, 2-17 bubbles) and it needs no
@@ -1451,7 +1451,7 @@ def check_pop_and_combo(rom):
 
 
 def main():
-    rom = sys.argv[1] if len(sys.argv) > 1 else "bubble.gb"
+    rom = sys.argv[1] if len(sys.argv) > 1 else "Puzzle-Balloon.gb"
     border = check_border_data()
     check_sgb_header(rom)
     check_font_order()

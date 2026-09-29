@@ -1,5 +1,5 @@
 /*
- * BUBBLE - Puzzle Bobble / Bust-A-Move style skeleton for Game Boy (DMG)
+ * PUZZLE BALLOON - Puzzle Bobble / Bust-A-Move style skeleton for Game Boy (DMG)
  * GBDK-2020.  No external assets: bubble tiles are generated at startup.
  *
  * NOTE: written without access to a compiler, so expect to fix a typo or two.

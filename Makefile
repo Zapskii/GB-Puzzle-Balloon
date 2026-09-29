@@ -1,5 +1,5 @@
-# BUBBLE build.
-#   make          build bubble.gb   (GBDK if GBDK_HOME is set, else Docker)
+# Puzzle Balloon build.
+#   make          build Puzzle-Balloon.gb  (GBDK if GBDK_HOME is set, else Docker)
 #   make border   regenerate border_data.c from art/border_sgb.png (SGB border)
 #   make usage    ROM/RAM headroom
 #   make shot     headless PyBoy screenshot (see tools/shot.py)
@@ -42,14 +42,14 @@ endif
 #   makes sgb_check() false, so the border is never uploaded and nothing looks
 #   broken: it is. 0x014B (old licensee) is 0x33 already, which is the other half
 #   of the test. A DMG ignores both bytes, so this costs nothing there.
-CFLAGS = -Wm-ys -Wm-yn"BUBBLE" -Wl-m -Wl-j
+CFLAGS = -Wm-ys -Wm-yn"Puzzle-Balloon" -Wl-m -Wl-j
 
 CFILES = main.c audio.c sgb_border.c border_data.c
 HFILES = audio.h sgb_border.h border_data.h
 
-all: bubble.gb
+all: Puzzle-Balloon.gb
 
-bubble.gb: $(CFILES) $(HFILES)
+Puzzle-Balloon.gb: $(CFILES) $(HFILES)
 	$(RUN) $(LCC) $(CFLAGS) -o $@ $(CFILES)
 
 # The Super Game Boy border: art/border_sgb.png (256x224; the 160x144 game area
@@ -62,17 +62,17 @@ border:
 	$(RUN) $(P2A) art/border_sgb.png -map -bpp 4 -max_palettes 4 \
 	      -pack_mode sgb -use_map_attributes -c border_data.c
 
-usage: bubble.gb
-	$(RUN) $(USAGE) bubble.map -g
+usage: Puzzle-Balloon.gb
+	$(RUN) $(USAGE) Puzzle-Balloon.map -g
 
-test: bubble.gb
-	$(PY) tools/smoke.py bubble.gb
+test: Puzzle-Balloon.gb
+	$(PY) tools/smoke.py Puzzle-Balloon.gb
 
-shot: bubble.gb
-	$(PY) tools/shot.py bubble.gb /tmp/bubble.png 120 "$(SCRIPT)"
+shot: Puzzle-Balloon.gb
+	$(PY) tools/shot.py Puzzle-Balloon.gb /tmp/puzzle-balloon.png 120 "$(SCRIPT)"
 
 clean:
-	rm -f bubble.gb *.map *.sym *.lst *.rel *.asm *.ihx *.noi *.adb *.cdb
-	rm -rf /tmp/bubble.png
+	rm -f Puzzle-Balloon.gb *.map *.sym *.lst *.rel *.asm *.ihx *.noi *.adb *.cdb
+	rm -rf /tmp/puzzle-balloon.png
 
 .PHONY: all border test usage shot clean
