@@ -44,8 +44,8 @@ endif
 #   of the test. A DMG ignores both bytes, so this costs nothing there.
 CFLAGS = -Wm-ys -Wm-yn"BUBBLE" -Wl-m -Wl-j
 
-CFILES = main.c sgb_border.c border_data.c
-HFILES = sgb_border.h border_data.h
+CFILES = main.c audio.c sgb_border.c border_data.c
+HFILES = audio.h sgb_border.h border_data.h
 
 all: bubble.gb
 
