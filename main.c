@@ -19,9 +19,13 @@
  */
 
 #include <gb/gb.h>
+#include <gb/sgb.h>
 #include <rand.h>
 #include <stdint.h>
 #include <string.h>
+
+#include "border_data.h"
+#include "sgb_border.h"
 
 /* ---------------- configuration ---------------- */
 #define GRID_ROWS    8
@@ -49,7 +53,6 @@
  * would be a lot of ROM for nothing. BG ids must stay below 128 whatever gets
  * added here: LCDC bit 4 is 0, so >= 128 aliases into the sprite tiles. */
 #define T_FONT       18
-#define FONT_LEN     24
 
 /* Sprite tile ids (8x16 mode: bubble colour c at c*4) */
 #define S_DOT        16
@@ -598,7 +601,10 @@ static void flash(uint8_t times)
  * on a baseline. Written as shapes rather than as tile bytes because a tile needs
  * its two bit planes interleaved, and doing that in load_font() keeps the shapes
  * legible here. Ink is colour 3, black against the blank background. */
-static const char FONT_ORDER[] = " ABCELNOPRSTUZ0123456789";
+static const char FONT_ORDER[] = " ABCEIKLNOPRSTUYZ0123456789";
+/* Counted from the string above, not written twice: FONT_GLYPHS rows beyond
+ * FONT_ORDER would leave the glyph blank and the char unmapped, silently. */
+#define FONT_LEN (sizeof FONT_ORDER - 1)
 
 static const uint8_t FONT_GLYPHS[FONT_LEN][8] = {
     { 0x00,0x00,0x00,0x00,0x00,0x00,0x00,0x00 },   /* space */
@@ -606,6 +612,8 @@ static const uint8_t FONT_GLYPHS[FONT_LEN][8] = {
     { 0xF0,0x88,0x88,0xF0,0x88,0x88,0xF0,0x00 },   /* B */
     { 0x70,0x88,0x80,0x80,0x80,0x88,0x70,0x00 },   /* C */
     { 0xF8,0x80,0x80,0xF0,0x80,0x80,0xF8,0x00 },   /* E */
+    { 0xF8,0x20,0x20,0x20,0x20,0x20,0xF8,0x00 },   /* I */
+    { 0x88,0x90,0xA0,0xC0,0xA0,0x90,0x88,0x00 },   /* K */
     { 0x80,0x80,0x80,0x80,0x80,0x80,0xF8,0x00 },   /* L */
     { 0x88,0xC8,0xA8,0x98,0x88,0x88,0x88,0x00 },   /* N */
     { 0x70,0x88,0x88,0x88,0x88,0x88,0x70,0x00 },   /* O */
@@ -614,6 +622,7 @@ static const uint8_t FONT_GLYPHS[FONT_LEN][8] = {
     { 0x78,0x80,0x80,0x70,0x08,0x08,0xF0,0x00 },   /* S */
     { 0xF8,0x20,0x20,0x20,0x20,0x20,0x20,0x00 },   /* T */
     { 0x88,0x88,0x88,0x88,0x88,0x88,0x70,0x00 },   /* U */
+    { 0x88,0x88,0x50,0x20,0x20,0x20,0x20,0x00 },   /* Y */
     { 0xF8,0x08,0x10,0x20,0x40,0x80,0xF8,0x00 },   /* Z */
     { 0x70,0x88,0x88,0x88,0x88,0x88,0x70,0x00 },   /* 0 */
     { 0x20,0x60,0x20,0x20,0x20,0x20,0x70,0x00 },   /* 1 */
@@ -762,15 +771,11 @@ static void wait_or_skip(uint16_t frames)
     waitpadup();
 }
 
-void main(void)
+/* All of the tile data, BG and sprite. A function rather than inline in main()
+ * because the SGB border transfer below overwrites VRAM to do its job, so the
+ * tiles have to go up a second time afterwards. */
+static void load_tiles(void)
 {
-    uint8_t won;
-
-    DISPLAY_OFF;
-    SPRITES_8x16;
-    BGP_REG  = 0xE4;
-    OBP0_REG = 0xE4;
-
     build_bubble_gfx();
     /* tile 0 must be blank: the second half of dot_gfx is all zeroes */
     set_bkg_data(T_BLANK, 1, dot_gfx + 16);
@@ -779,6 +784,18 @@ void main(void)
     set_sprite_data(0, 16, gfx);
     set_sprite_data(S_DOT, 2, dot_gfx);
     load_font();
+}
+
+void main(void)
+{
+    uint8_t won, i;
+
+    DISPLAY_OFF;
+    SPRITES_8x16;
+    BGP_REG  = 0xE4;
+    OBP0_REG = 0xE4;
+
+    load_tiles();
 
     /* The boot ROM drew its Nintendo logo into the BG map and left it there,
      * so clear the screen before turning the LCD back on: otherwise the wait
@@ -790,6 +807,21 @@ void main(void)
     SHOW_BKG;
     SHOW_SPRITES;
     DISPLAY_ON;
+
+    /* The Super Game Boy border, once, at boot. The SGB reads the CHR_TRN/PCT_TRN
+     * payloads off the rendered screen, so this has to come after DISPLAY_ON --
+     * and it trashes VRAM getting there, hence load_tiles() again below. Four
+     * frames first: a PAL SNES needs that delay at startup or no border shows.
+     * sgb_check() is false on a DMG, so an ordinary Game Boy boots exactly as it
+     * did before and pays only the four frames. */
+    for (i = 0; i != 4; i++) vsync();
+    if (sgb_check()) {
+        set_sgb_border((unsigned char *)border_data_tiles, sizeof(border_data_tiles),
+                       (unsigned char *)border_data_map, sizeof(border_data_map),
+                       (unsigned char *)border_data_palettes, sizeof(border_data_palettes));
+        load_tiles();
+        fill_bkg_rect(0, 0, 20, 18, T_BLANK);
+    }
 
     /* A game is titles -> boards until it is lost -> back to the title, forever.
      * Losing ends the game; clearing a board only advances the level. */

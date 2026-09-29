@@ -16,9 +16,13 @@ FRAME. Pressing once and then ticking many frames does not reach the game.
 
 This is a DEV TOOL. Nothing in the build depends on it.
 """
+import os
+import re
 import sys
 
 from pyboy import PyBoy
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 MAP = 0x9800            # BG map base (LCDC bit 3 clear)
 WALL_TILES = 18 * 4     # both side walls, full height
@@ -27,11 +31,87 @@ WALL_TILES = 18 * 4     # both side walls, full height
 TITLE_COUNT = [8, 7, 6, 5, 4, 3]
 TITLE_START = [0, 0, 1, 1, 2, 2]
 T_FONT = 18                              # first font tile id
-FONT_ORDER = " ABCELNOPRSTUZ0123456789"   # glyph order, matches FONT_ORDER in main.c
+FONT_ORDER = " ABCEIKLNOPRSTUYZ0123456789"   # glyph order, matches FONT_ORDER in main.c
 TITLE_TEXT = [("PUZZLE BALLOON", 3, 12),  # string, tile column, tile row
               ("PRESS START", 4, 14)]
 SCORE_LABEL = "SCORE"                     # label row, then the digits under it
 SCORE_COL, SCORE_ROW, SCORE_DIGITS = 12, 16, 5
+
+
+def check_border_data(path=None):
+    """The SGB border data must be the shape set_sgb_border() can send.
+
+    PyBoy is not a Super Game Boy, so the CHR_TRN/PCT_TRN upload never runs here
+    -- it is gated on sgb_check().  What is checkable is the data that upload
+    would carry: those sizes come out of png2asset, and regenerating the border
+    with the wrong flags (no -pack_mode sgb, more than 4 palettes) breaks the SGB
+    quietly, with a border that is the wrong size or the wrong colour depth.
+    """
+    path = path or os.path.join(HERE, os.pardir, "border_data.h")
+    src = open(path).read()
+
+    def num(name):
+        m = re.search(r"#define\s+%s\s+(\d+)" % name, src)
+        assert m, "border_data.h has no %s -- did `make border` run?" % name
+        return int(m.group(1))
+
+    def array(name):
+        m = re.search(r"%s\[(\d+)\]" % name, src)
+        assert m, "border_data.h has no %s[]" % name
+        return int(m.group(1))
+
+    tiles, pals, cpp = (num("border_data_TILE_COUNT"),
+                        num("border_data_PALETTE_COUNT"),
+                        num("border_data_COLORS_PER_PALETTE"))
+    # One CHR_TRN pair is the whole border: 256 4bpp tiles of 32 bytes.
+    assert 0 < tiles <= 256, "%d border tiles, the SGB holds 256" % tiles
+    assert array("border_data_tiles") == tiles * 32, \
+        "border tile data is not 32 bytes per tile (bpp wrong?)"
+    # 256x224 in 8x8 cells, two bytes each: tile index plus the palette attribute.
+    assert array("border_data_map") == 1792, "border map is not 32x28 cells"
+    assert 0 < pals <= 4 and cpp == 16, "%d palettes of %d colours" % (pals, cpp)
+    # palette_color_t is uint16_t, so the count is in elements, not bytes.
+    assert array("border_data_palettes") == pals * cpp, "not 16 colours per palette"
+    return "%dt/%dp" % (tiles, pals)
+
+
+def check_sgb_header(rom):
+    """The cartridge header has to claim SGB support, or there is no border at all.
+
+    mGBA picks the handheld model from 0x0146 (paired with the old-licensee byte
+    0x014B), so without it mGBA emulates a plain DMG, sgb_check() is false, the
+    border is never uploaded -- and nothing else looks wrong, which is exactly how
+    a missing -Wm-ys hides. A real SGB BIOS reads the same two bytes.
+    """
+    head = open(rom, "rb").read(0x150)
+    assert head[0x146] == 0x03, \
+        "header 0x0146 is 0x%02X, not 0x03: no SGB flag (missing -Wm-ys?)" % head[0x146]
+    assert head[0x14B] == 0x33, \
+        "header 0x014B is 0x%02X, not 0x33: the SGB flag is ignored without it" % head[0x14B]
+    return "0x%02X" % head[0x146]
+
+
+def check_font_order(path=None):
+    """FONT_ORDER and FONT_GLYPHS must list the same characters in the same order.
+
+    Nothing else catches this. The game turns a character into a tile by
+    searching FONT_ORDER, and everything here compares tile IDS -- so a glyph row
+    inserted in the wrong place leaves every id still lining up and the screen
+    quietly renders the wrong letter. That is not hypothetical: adding I, K and Y
+    to the font put them before E, and the border read "PUZZLI BALLOON" with this
+    test green. The glyph comments name each row, so the order is checkable from
+    the source.
+    """
+    path = path or os.path.join(HERE, os.pardir, "main.c")
+    src = open(path).read()
+    order = re.search(r'FONT_ORDER\[\]\s*=\s*"([^"]*)"', src).group(1)
+    body = re.search(r'FONT_GLYPHS\[.*?\]\s*=\s*\{(.*?)\n\};', src, re.S).group(1)
+    names = re.findall(r"/\*\s*([A-Za-z0-9]+)\s*\*/", body)
+    want = ["space" if ch == " " else ch for ch in order]
+    assert names == want, \
+        "FONT_GLYPHS is %r but FONT_ORDER is %r: the screen would draw the wrong letters" \
+        % (names, want)
+    return len(order)
 
 
 def expected_title_map():
@@ -204,6 +284,9 @@ def fall_watch(py, frames):
 
 def main():
     rom = sys.argv[1] if len(sys.argv) > 1 else "bubble.gb"
+    border = check_border_data()
+    check_sgb_header(rom)
+    check_font_order()
     py = PyBoy(rom, window="null", sound_emulated=False)
 
     def frames(n, key=None):
@@ -307,8 +390,9 @@ def main():
     assert skip is not None and 0 < skip < 280, \
         "A did not cut the game-over hold short (%s frames)" % skip
 
-    print("ok: walls=%d start_tiles=%d counts=%s score=%d game_over->title=%d frames (A: %d)"
-          % (walls, start, sorted(seen), final_score, gap, skip))
+    print("ok: sgb_border=%s walls=%d start_tiles=%d counts=%s score=%d "
+          "game_over->title=%d frames (A: %d)"
+          % (border, walls, start, sorted(seen), final_score, gap, skip))
     py.stop(save=False)
 
 
