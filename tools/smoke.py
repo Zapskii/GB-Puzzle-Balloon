@@ -32,11 +32,16 @@ WALL_TILES = 18 * 4     # both side walls, full height
 TITLE_COUNT = [8, 7, 6, 5, 4, 3]
 TITLE_START = [0, 0, 1, 1, 2, 2]
 T_FONT = 18                              # first font tile id
-FONT_ORDER = " ABCEIKLNOPRSTUYZ0123456789"   # glyph order, matches FONT_ORDER in main.c
+FONT_ORDER = " ABCEGIKLMNOPRSTUVYZ0123456789"   # glyph order, matches FONT_ORDER in main.c
 TITLE_TEXT = [("PUZZLE BALLOON", 3, 12),  # string, tile column, tile row
               ("PRESS START", 4, 14)]
+MSG_ROW = 12                              # end-of-board messages, screen tile row
+MSG_OVER, MSG_OVER_COL = "GAME OVER", 5   # must match MSG_OVER / MSG_OVER_COL in main.c
 SCORE_LABEL = "SCORE"                     # label row, then the digits under it
 SCORE_COL, SCORE_ROW, SCORE_DIGITS = 12, 0, 5   # rows are window rows, not screen
+LEVEL_LABEL = "LV"                        # the level readout, in the other free run
+LEVEL_COL, LEVEL_ROW, LEVEL_DIGITS = 5, 0, 2
+LEVEL_NUM_COL = 7                         # LEVEL_COL + the two tiles of "LV"
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 
@@ -114,6 +119,15 @@ def check_font_order(path=None):
     assert names == want, \
         "FONT_GLYPHS is %r but FONT_ORDER is %r: the screen would draw the wrong letters" \
         % (names, want)
+
+    # Every character the game prints must have a glyph. A missing one is not a
+    # crash: font_tile() falls back to the space tile, so the message quietly
+    # loses letters. "STAGE CLEAR" needs this most -- nothing headless ever
+    # clears a board, so that string is only ever checked here, in the source.
+    for name in ("MSG_CLEAR", "MSG_OVER"):
+        msg = re.search(r'%s\s+"([^"]*)"' % name, src).group(1)
+        missing = sorted(set(msg) - set(order))
+        assert not missing, "%s %r has no glyph for %r" % (name, msg, missing)
     return len(order)
 
 
@@ -189,6 +203,56 @@ def score(py):
     return n
 
 
+def strip_clear_of_sprites(py, col, width):
+    """True when no visible strip sprite covers the tile span col .. col+width-1.
+
+    The launcher and next bubbles are sprites, and sprites draw OVER the window
+    layer, so a strip field can be perfectly correct in the tilemap and still be
+    half hidden. That is not hypothetical: the level field's digits first went at
+    cols 8-9 and the "1" sat behind the launcher bubble, with every tile id right
+    and `level()` reading it happily. OAM x is offset by 8, so a 16px bubble at
+    x32 covers cols 3-4 and one at x80 covers cols 9-10 -- not the columns an
+    earlier note guessed from the x values alone.
+    """
+    left, right = col * 8, (col + width) * 8 - 1
+    for s in range(4):                      # launcher (0-1) then next (2-3)
+        x = py.memory[0xFE01 + s * 4]
+        if x and x - 8 <= right and x - 8 + 7 >= left:
+            return False
+    return True
+
+
+def level(py):
+    """The level as an int, or None if the field is not "LV" + two digits.
+
+    Same shape as score(), and the same job: a wrong width, a missing label or a
+    stray tile reads as None here rather than as a silently wrong number. The
+    game shows level + 1 (its `level` is 0-based), so the first board must read 1.
+    """
+    want = [T_FONT + FONT_ORDER.index(ch) for ch in LEVEL_LABEL]
+    if [win_tile(py, LEVEL_COL + i, LEVEL_ROW) for i in range(len(LEVEL_LABEL))] != want:
+        return None
+    n = 0
+    for c in range(LEVEL_NUM_COL, LEVEL_NUM_COL + LEVEL_DIGITS):
+        t = win_tile(py, c, LEVEL_ROW + 1)
+        if not T_ZERO <= t <= T_ZERO + 9:
+            return None
+        n = n * 10 + (t - T_ZERO)
+    return n
+
+
+def msg_on_screen(py, text, col, row):
+    """True when `text` is drawn on screen at (col, row).
+
+    Read through tile(), which follows SCY: the game draws the message by SCREEN
+    row (see draw_text() in main.c), so a drop's slide must not move it -- and if
+    it did, this is what would catch it, since a loss is nearly always preceded by
+    one. .index() raises on a glyph that is not in FONT_ORDER.
+    """
+    return [tile(py, col + i, row) for i, ch in enumerate(text)] == \
+           [T_FONT + FONT_ORDER.index(ch) for ch in text]
+
+
 def bubble_tiles(py):
     """Bubble tiles (a bubble is 4 tiles) in the playfield."""
     return sum(1 for r in range(16) for c in range(2, 18)
@@ -234,6 +298,13 @@ def game_over_to_title(py, frames, shot_budget=60, skip=False):
                 return -1 if over is None else n - over
             if over is None and all(py.memory[0xFE00 + s * 4] == 0 for s in range(7)):
                 over = n                # launcher, next bubble and aim dots all gone
+                # ...and that is main() drawing "GAME OVER" over the board. This is
+                # the only place the message is checked on screen: it is drawn and
+                # never cleared, so it is still up all through the hold.
+                assert msg_on_screen(py, MSG_OVER, MSG_OVER_COL, MSG_ROW), \
+                    "GAME OVER is not on the board at row %d cols %d-%d (tiles %s)" % (
+                        MSG_ROW, MSG_OVER_COL, MSG_OVER_COL + len(MSG_OVER) - 1,
+                        [tile(py, MSG_OVER_COL + i, MSG_ROW) for i in range(len(MSG_OVER))])
             if skip and over is not None and n - over == 130:
                 # ~1.5s in: past the 96-frame game-over flash, which does not read
                 # the pad, and well inside the hold that follows. A tap, not a hold,
@@ -414,13 +485,38 @@ def main():
         py.tick(1, True)
         if wall_count(py) == WALL_TILES:
             break
-    frames(5)
+
+    # ...then for the aim loop to put its dots up, which is the real "a board is
+    # being played" signal. The walls are NOT it: the title screen draws the same
+    # walls, so that condition is already true while the title is still up, and
+    # this used to be a fixed frames(5) that only worked because the redraw and
+    # play() happened to land exactly there. Adding the level readout moved it by
+    # a frame and the shot fired before the dots existed. The title never places
+    # dots, so waiting for them is exact.
+    for _ in range(60):
+        py.tick(1, True)
+        if all(py.memory[0xFE01 + s * 4] for s in (4, 5, 6)):
+            break
 
     walls = wall_count(py)
     assert walls == WALL_TILES, "walls not drawn: %d/%d tiles" % (walls, WALL_TILES)
 
     start = bubble_tiles(py)
     assert start >= 24, "starting board is empty (%d tiles)" % start
+
+    # The level readout, drawn by draw_level() at the start of every board. This is
+    # the one point a headless run sees it from: nothing here clears a board, so the
+    # level never rises. Reading 1 rather than 0 is the point -- the game's `level`
+    # is 0-based and the field adds 1.
+    assert level(py) == 1, "level field is not LV + two digits reading 01 (tiles %s / %s)" % (
+        [win_tile(py, c, LEVEL_ROW) for c in range(LEVEL_COL, LEVEL_NUM_COL + LEVEL_DIGITS)],
+        [win_tile(py, c, LEVEL_ROW + 1) for c in range(LEVEL_COL, LEVEL_NUM_COL + LEVEL_DIGITS)])
+
+    # ...and that the launcher and next-bubble sprites are not sitting on it. The
+    # field fills the only gap between them, so the two have to agree.
+    assert strip_clear_of_sprites(py, LEVEL_COL, LEVEL_DIGITS + len(LEVEL_LABEL)), \
+        "a strip sprite covers the level field at cols %d-%d" % (
+            LEVEL_COL, LEVEL_COL + LEVEL_DIGITS + len(LEVEL_LABEL) - 1)
 
     # The un-steered shot must be exactly vertical -- see aim_up().
     assert aim_up(py, frames), "the default aim is not straight up"

@@ -258,7 +258,9 @@ static void draw_board(void)
     }
 }
 
-static void draw_score(void);          /* defined with the font, further down */
+/* Both live with the font, further down. */
+static void draw_score(void);
+static void draw_level(void);
 
 static void redraw_all(void)
 {
@@ -267,6 +269,7 @@ static void redraw_all(void)
     SCY_REG = 0;            /* SCY is always map_y0 * 8 */
     draw_board();
     draw_score();
+    draw_level();
     DISPLAY_ON;
 }
 
@@ -653,7 +656,7 @@ static void flash(uint8_t times)
  * on a baseline. Written as shapes rather than as tile bytes because a tile needs
  * its two bit planes interleaved, and doing that in load_font() keeps the shapes
  * legible here. Ink is colour 3, black against the blank background. */
-static const char FONT_ORDER[] = " ABCEIKLNOPRSTUYZ0123456789";
+static const char FONT_ORDER[] = " ABCEGIKLMNOPRSTUVYZ0123456789";
 /* Counted from the string above, not written twice: FONT_GLYPHS rows beyond
  * FONT_ORDER would leave the glyph blank and the char unmapped, silently. */
 #define FONT_LEN (sizeof FONT_ORDER - 1)
@@ -664,9 +667,11 @@ static const uint8_t FONT_GLYPHS[FONT_LEN][8] = {
     { 0xF0,0x88,0x88,0xF0,0x88,0x88,0xF0,0x00 },   /* B */
     { 0x70,0x88,0x80,0x80,0x80,0x88,0x70,0x00 },   /* C */
     { 0xF8,0x80,0x80,0xF0,0x80,0x80,0xF8,0x00 },   /* E */
+    { 0x70,0x88,0x80,0xB8,0x88,0x88,0x70,0x00 },   /* G */
     { 0xF8,0x20,0x20,0x20,0x20,0x20,0xF8,0x00 },   /* I */
     { 0x88,0x90,0xA0,0xC0,0xA0,0x90,0x88,0x00 },   /* K */
     { 0x80,0x80,0x80,0x80,0x80,0x80,0xF8,0x00 },   /* L */
+    { 0x88,0xD8,0xA8,0x88,0x88,0x88,0x88,0x00 },   /* M */
     { 0x88,0xC8,0xA8,0x98,0x88,0x88,0x88,0x00 },   /* N */
     { 0x70,0x88,0x88,0x88,0x88,0x88,0x70,0x00 },   /* O */
     { 0xF0,0x88,0x88,0xF0,0x80,0x80,0x80,0x00 },   /* P */
@@ -674,6 +679,7 @@ static const uint8_t FONT_GLYPHS[FONT_LEN][8] = {
     { 0x78,0x80,0x80,0x70,0x08,0x08,0xF0,0x00 },   /* S */
     { 0xF8,0x20,0x20,0x20,0x20,0x20,0x20,0x00 },   /* T */
     { 0x88,0x88,0x88,0x88,0x88,0x88,0x70,0x00 },   /* U */
+    { 0x88,0x88,0x88,0x88,0x88,0x50,0x20,0x00 },   /* V */
     { 0x88,0x88,0x50,0x20,0x20,0x20,0x20,0x00 },   /* Y */
     { 0xF8,0x08,0x10,0x20,0x40,0x80,0xF8,0x00 },   /* Z */
     { 0x70,0x88,0x88,0x88,0x88,0x88,0x70,0x00 },   /* 0 */
@@ -709,13 +715,21 @@ static uint8_t font_tile(char ch)
 }
 
 /* Writes BG tiles one at a time, the same call draw_cell() makes, so it is safe
- * mid-game as well as under DISPLAY_OFF. */
+ * mid-game as well as under DISPLAY_OFF.
+ *
+ * `row` is a SCREEN tile row, not a map row. A ceiling drop leaves SCY non-zero
+ * for the rest of the level, and a raw map row would then land the text however
+ * far the board has walked up the map -- which is why the title screen, where
+ * SCY is 0, is the only place the two happened to be the same. SCY is a multiple
+ * of 8 everywhere except the 16 frames of a slide, so SCY >> 3 is exactly the map
+ * row under a screen row. (The 16-frame slide is the one case a row can be
+ * neither: nothing draws text mid-slide.) */
 static void draw_text(uint8_t col, uint8_t row, const char *s)
 {
-    uint8_t t;
+    uint8_t t, mrow = (uint8_t)((row + (SCY_REG >> 3)) & 31);
     while (*s) {
         t = font_tile(*s++);
-        set_bkg_tiles(col++, row, 1, 1, &t);
+        set_bkg_tiles(col++, mrow, 1, 1, &t);
     }
 }
 
@@ -743,6 +757,19 @@ static void draw_win_text(uint8_t col, uint8_t row, const char *s)
 #define SCORE_LABEL   "SCORE"
 #define SCORE_DIGITS  5              /* 65535 fits; the score is uint16_t */
 
+/* The level readout, in the other free run of the strip. A sprite at x covers the
+ * screen from x-8 (OAM is offset by 8), so the next preview (x32) owns cols 3-4,
+ * the launcher (x80) cols 9-10, the score cols 12-17 and the walls 0-1 and 18-19.
+ * That leaves cols 5-8 -- four tiles, all of them, which is why the label is "LV"
+ * and not "LEVEL", and why the field is flush against the launcher. Label over
+ * number, the same shape as the score and on its own columns, so neither field can
+ * reflow into the other. */
+#define LEVEL_COL     5
+#define LEVEL_ROW     0
+#define LEVEL_LABEL   "LV"
+#define LEVEL_NUM_COL 7              /* LEVEL_COL + the two tiles of "LV" */
+#define LEVEL_DIGITS  2              /* see draw_level() for the ceiling this sets */
+
 /* Zero-padded, so the field never reflows as it grows. */
 static void draw_score(void)
 {
@@ -758,6 +785,31 @@ static void draw_score(void)
         v /= 10;
     }
     draw_win_text(SCORE_COL, SCORE_ROW + 1, s);
+}
+
+/* Shown as level + 1: `level` is 0-based, so the first board would otherwise read
+ * "LV 00". Drawn once per board, from redraw_all(), which is the only place the
+ * level can change -- it rises when a board is cleared, and the strip is the
+ * window layer, which no ceiling drop touches, so nothing redraws it mid-level.
+ *
+ * ponytail: two digits, so "LV 99" is the last level that fits the four-tile run.
+ * The level only rises on a cleared board, so reaching it means clearing 99 of
+ * them; widen the field if that ever stops being true. The strip has no spare
+ * column, so widening means moving the next preview -- see the LEVEL_COL note. */
+static void draw_level(void)
+{
+    char s[LEVEL_DIGITS + 1];
+    uint8_t v = (uint8_t)(level + 1);
+    int8_t i;
+
+    draw_win_text(LEVEL_COL, LEVEL_ROW, LEVEL_LABEL);
+
+    s[LEVEL_DIGITS] = 0;
+    for (i = LEVEL_DIGITS - 1; i >= 0; i--) {
+        s[i] = (char)('0' + (v % 10));
+        v /= 10;
+    }
+    draw_win_text(LEVEL_NUM_COL, LEVEL_ROW + 1, s);
 }
 
 /* ---------------- title screen ---------------- */
@@ -820,6 +872,17 @@ static uint16_t title_screen(void)
  * roughly 60Hz -- before the title comes back. A or B (or START) cuts it short. */
 #define GAME_OVER_FLASH   6              /* flashes, 16 frames each */
 #define GAME_OVER_HOLD    204            /* the rest of the 5s: 6*16 + 204 = 300 */
+
+/* The end-of-board messages, drawn on the BG over the board itself: the window
+ * strip is two tile rows tall and the score and level already own most of it. The
+ * board is 16 tile rows, so row 12 sits across its lower half, and the columns
+ * centre a message in the 16-tile playfield (cols 2..17) the same way the title
+ * centres its name. Rows here are SCREEN rows, which is what draw_text() takes. */
+#define MSG_ROW       12
+#define MSG_CLEAR     "STAGE CLEAR"
+#define MSG_CLEAR_COL 4                  /* 2 + (16 - 11) / 2 */
+#define MSG_OVER      "GAME OVER"
+#define MSG_OVER_COL  5                  /* 2 + (16 -  9) / 2 */
 
 /* Wait out the finished board, but let A or B skip it: whoever just lost knows it
  * and five seconds is a long time to stare at a board that will not change. START
@@ -927,14 +990,18 @@ void main(void)
             if (!won) break;             /* game over */
 
             level++;
+            /* Drawn before the flash so the message is what blinks. */
+            draw_text(MSG_CLEAR_COL, MSG_ROW, MSG_CLEAR);
             flash(3);
             waitpad(J_START);            /* START carries on to the next board */
             waitpadup();
         }
 
+        draw_text(MSG_OVER_COL, MSG_ROW, MSG_OVER);
         flash(GAME_OVER_FLASH);
         wait_or_skip(GAME_OVER_HOLD);
 
-        /* TODO: show "STAGE CLEAR" / "GAME OVER" (needs more glyphs) */
+        /* No need to clear the message: title_screen() redraws the whole board
+         * inside DISPLAY_OFF, and it resets SCY and map_y0 with it. */
     }
 }
