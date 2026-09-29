@@ -377,8 +377,8 @@ def bubble_tiles(py):
                if 2 <= tile(py, c, r) <= 17)
 
 
-def board_address(py):
-    """Locate main.c's `board[8][8]` in WRAM by matching it against the screen.
+def board_match(py):
+    """Locate main.c's `board[8][8]` in WRAM and the row parity, by matching the screen.
 
     The linker map lists no statics, so the only handle on the board is that its
     bytes ARE what is drawn: 0 for an empty cell, colour + 1 otherwise, and
@@ -388,7 +388,8 @@ def board_address(py):
 
     Which rows are shifted depends on `parity`, which is not readable from here
     (SHIFTED(r) is (r ^ parity) & 1 and every drop toggles it), so both are tried
-    and the byte match decides.
+    and the byte match decides. The parity comes back with the address because a
+    caller that rewrites the board in RAM has to know which rows take 7 cells.
     """
     def drawn(parity):
         want = []
@@ -402,11 +403,16 @@ def board_address(py):
                 want.append((t - 2) // 4 + 1 if 2 <= t <= 17 else 0)
         return want
 
-    hits = [a for parity in (0, 1) for a in range(0xC000, 0xE000 - 64)
+    hits = [(a, parity) for parity in (0, 1) for a in range(0xC000, 0xE000 - 64)
             if list(py.memory[a:a + 64]) == drawn(parity)]
     assert len(hits) == 1, \
         "found %d WRAM windows matching the drawn board, expected exactly 1" % len(hits)
     return hits[0]
+
+
+def board_address(py):
+    """main.c's `board[8][8]` address in WRAM -- see board_match()."""
+    return board_match(py)[0]
 
 
 def mask_from_ram(py, addr):
@@ -1056,6 +1062,206 @@ def check_audio(rom):
     return "fire/bounce/pop/warn(early=%d, bursts=%d)" % (early, warns)
 
 
+# --- pop feedback and combo scoring ---
+T_BURST = 48                     # main.c's T_BURST: 4 tiles, one 2x2 cell
+BURST_TILES = range(T_BURST, T_BURST + 4)
+# The forced pop: the cells the burst has to land on -- see force() below.
+CLUSTER = ((1, 2), (1, 3), (1, 4), (2, 3))
+
+
+def screen_cell(r, c, parity):
+    """The four BG map tiles a board cell occupies, as (col, row) SCREEN cells.
+
+    Spelled out rather than derived from the drawn map so the check knows where a
+    cell is even after the board in RAM has been rewritten -- which is the whole
+    point of forcing one. The shift is SHIFTED(r) = (r ^ parity) & 1.
+    """
+    s = (r ^ parity) & 1
+    return {(2 + c * 2 + s + dx, r * 2 + dy) for dx in (0, 1) for dy in (0, 1)}
+
+
+def burst_tiles(py):
+    """Every playfield cell showing a burst tile, as (col, row) screen cells."""
+    return {(c, r) for r in range(16) for c in range(2, 18)
+            if tile(py, c, r) in BURST_TILES}
+
+
+def check_pop_and_combo(rom):
+    """A popped cluster has to be marked before it goes, and pops in a row have to pay more.
+
+    Three claims, all measured on a board this check forces, because which shot
+    pops is not predictable in ordinary play:
+
+      * **The burst.** Every cell of the cluster turns into a burst tile for a few
+        frames (main.c's POP_FRAMES) before any of it is erased. Asserted as an
+        exact tile set -- the burst has to cover all four cells of the forced
+        cluster and nothing else, which pins both the beat and the cell it is
+        drawn on. An instant erase leaves this set empty.
+
+      * **The combo.** Four shots that each pop four bubbles, one after another.
+        The score gain has to rise by a constant positive step, which is what
+        says the multiplier is the run length and not flat and not doubling.
+
+      * **No wrap.** The score is a uint16_t shown as five digits. Sampled at every
+        pop and asserted non-decreasing -- a wrapped total reads as a drop -- and
+        then forced, in RAM, to 65520 immediately before a pop: the field must
+        read 65535 afterwards. A build that lets the total wrap reads 24 there.
+        That is main.c's add_score() clamp, and forcing the score is the only way
+        to reach it headlessly: an honest smoke run is nowhere near 65535.
+
+    WHAT THIS DOES NOT COVER. The award arithmetic itself: the bound that makes one
+    pop's points fit a uint16_t at COMBO_MAX is a property of main.c's constants,
+    not of anything observable here (a full board at COMBO_MAX is 15360 of 65535,
+    so no amount of play reaches it). The clamp is only reachable because the score
+    is forced into RAM. And nothing here hears the pop: sfx_pop() is check_audio()'s.
+
+    Its own PyBoy, like check_audio(), and for the same kind of reason plus one
+    more: it rewrites the board and the score in RAM, which leaves the machine in a
+    state no other check can read. A fresh instance is a fresh board, which is what
+    board_match() needs -- it locates board[] by matching it against the screen, and
+    after this check has forced one the two no longer agree.
+    """
+    py = PyBoy(rom, window="null", sound_emulated=False)
+
+    def frames(n, key=None):
+        for _ in range(n):
+            if key:
+                py.button_press(key)
+            py.tick(1, True)
+            if key:
+                py.button_release(key)
+
+    for _ in range(600):
+        py.tick(1, True)
+        if is_title(py):
+            break
+    else:
+        raise AssertionError("the title screen never came up: cannot reach a board")
+
+    frames(3, "start")
+    for _ in range(300):
+        py.tick(1, True)
+        if all(py.memory[0xFE01 + s * 4] for s in (4, 5, 6)):
+            break
+    else:
+        raise AssertionError("the aim dots never appeared: no board was started")
+
+    addr, parity = board_match(py)
+
+    def force():
+        """Rewrite the board in RAM into the shape the next shot is sure to pop.
+
+        Rows 2-7 empty, so the shot meets nothing on the way up; (1,2)-(1,4) in the
+        colour the launcher is holding, so the bubble it lands joins a run of three
+        and the pop is four cells; and row 0 a full row of a different colour, so
+        the board is never cleared (which would end the level) and nothing is left
+        floating (whose 20-point bonus would land in the same score gain).
+
+        Three cells and not two: the default aim is dead vertical and the launcher
+        is at x=80, which is the centre of column 3 in a shifted row and between
+        columns 3 and 4 in an unshifted one -- and which of those a row is depends
+        on the parity. Covering 2, 3 and 4 makes the pop the same either way, and
+        the screen cells above are computed for the parity that is really there.
+        """
+        cur = py.memory[0xFE02] >> 2                    # the launcher's colour
+        for a in range(64):
+            py.memory[addr + a] = 0
+        for c in range(8 - ((0 ^ parity) & 1)):         # ROW_COLS(0)
+            py.memory[addr + c] = ((cur + 1) & 3) + 1   # ...a colour it is not
+        for c in (2, 3, 4):
+            py.memory[addr + 8 + c] = cur + 1
+        return cur
+
+    want_burst = set()
+    for r, c in CLUSTER:
+        want_burst |= screen_cell(r, c, parity)
+
+    gains, seen_score, first_burst, first_colour = [], [], None, None
+    for shot in range(4):
+        cur = force()
+        before = score(py)
+        seen_score.append(before)
+        frames(3, "a")
+        burst = None
+        for _ in range(200):
+            py.tick(1, True)
+            t = burst_tiles(py)
+            if t and burst is None:
+                burst = t                        # its first frame is the whole cluster
+            if burst and all(py.memory[0xFE01 + s * 4] for s in (4, 5, 6)):
+                break                            # the aim loop is back: the pop is done
+        assert burst, \
+            "shot %d popped %d bubbles and none of them was drawn as a burst before " \
+            "it went (no tiles %d-%d anywhere on the board): the pop still reads as " \
+            "an instant erase" % (shot, len(CLUSTER), T_BURST, T_BURST + 3)
+        if first_burst is None:
+            first_burst, first_colour = burst, cur
+        after = score(py)
+        seen_score.append(after)
+        assert before is not None and after is not None, \
+            "the score field stopped reading as SCORE + five digits during the pop " \
+            "(before %s, after %s)" % (before, after)
+        gains.append(after - before)
+
+    # The burst covers exactly the cells that are about to pop: the three forced
+    # bubbles and the bubble this shot landed. Anything else would mean the beat is
+    # not marking what it says it is marking.
+    assert first_burst == want_burst, \
+        "the burst covered %s, not the %d cells of the popped cluster (%s, colour %d): " \
+        "something other than the matched bubbles is being marked" % (
+            sorted(first_burst), len(CLUSTER), sorted(want_burst), first_colour)
+
+    # Four pops of four bubbles, back to back. Flat scoring pays the same for each;
+    # a multiplier equal to the run length pays 40, 80, 120, 160 -- so the step has
+    # to be constant and positive, which is also what rules out a doubling scheme.
+    steps = [gains[i + 1] - gains[i] for i in range(len(gains) - 1)]
+    assert all(g > 0 for g in gains), \
+        "a forced shot into a ready-made cluster paid nothing: gains %s (the board " \
+        "was forced but the shot did not pop it)" % gains
+    assert len(set(steps)) == 1 and steps[0] > 0, \
+        "four forced pops of the same four bubbles paid %s: the same pop is worth " \
+        "%s every time, so consecutive pops are not worth more" % (
+            gains, "the same" if gains.count(gains[0]) == len(gains) else "not")
+
+    assert seen_score == sorted(seen_score), \
+        "the score went down during play: %s (escalating points wrapped the uint16_t " \
+        "and the five-digit field is lying)" % seen_score
+
+    # And the clamp, at the top. The displayed total is the only handle on main.c's
+    # `score` (the linker map lists no statics, so there is no symbol for it), and
+    # the score is a 16-bit little-endian value in WRAM: find the pair. The board's
+    # own 64 bytes are excluded -- its cells are 0..4 and could hold the same pair.
+    top = score(py)
+    hits = [a for a in range(0xC000, 0xE000 - 1)
+            if py.memory[a] == (top & 0xFF) and py.memory[a + 1] == (top >> 8)
+            and not addr <= a < addr + 64]
+    assert len(hits) == 1, \
+        "found %d WRAM words holding the displayed score %d, expected exactly 1: " \
+        "cannot force the score to the top" % (len(hits), top)
+    py.memory[hits[0]] = 0xF0                    # 65520: any pop at all overflows
+    py.memory[hits[0] + 1] = 0xFF
+    force()
+    frames(3, "a")
+    got = None
+    for _ in range(200):
+        py.tick(1, True)
+        v = score(py)
+        if v is not None and v != top:
+            got = v
+            break
+    assert got is not None, \
+        "the score never moved away from %d: the forced shot did not pop" % top
+    assert got == 65535, \
+        "the score was 65520 and one more pop of the same four bubbles pushed it " \
+        "over the top, and the field reads %d: the award wrapped the uint16_t " \
+        "instead of stopping at 65535, so the display is showing a number the " \
+        "player has not earned" % got
+
+    py.stop(save=False)
+    return "burst=%d cells combo=%s clamp=%d" % (
+        len(first_burst) // 4, "->".join(str(g) for g in gains), got)
+
+
 def main():
     rom = sys.argv[1] if len(sys.argv) > 1 else "bubble.gb"
     border = check_border_data()
@@ -1066,6 +1272,9 @@ def main():
     # sound_emulated=False, where every sound register reads 0 and every write is
     # thrown away. Run before that instance exists rather than alongside it.
     audio = check_audio(rom)
+    # Also its own instance, and also before the shared one exists: it rewrites the
+    # board and the score in RAM, which leaves a machine no other check can read.
+    pop = check_pop_and_combo(rom)
     py = PyBoy(rom, window="null", sound_emulated=False)
 
     def frames(n, key=None):
@@ -1237,10 +1446,10 @@ def main():
     # this to happen on its own, so the state is forced.
     check_drop_keeps_colours(py, frames)
 
-    print("ok: sgb_border=%s walls=%d ramp=%s audio=%s after_shot=%d counts=%s score=%d "
-          "drop_scy=%d mid=%d game_over->title=%d frames (A: %d) preview=%s"
-          % (border, walls, ramp, audio, after_shot, sorted(seen), final_score, max(settled),
-             len(mid), gap, skip, preview))
+    print("ok: sgb_border=%s walls=%d ramp=%s audio=%s pop=%s after_shot=%d counts=%s "
+          "score=%d drop_scy=%d mid=%d game_over->title=%d frames (A: %d) preview=%s"
+          % (border, walls, ramp, audio, pop, after_shot, sorted(seen), final_score,
+             max(settled), len(mid), gap, skip, preview))
     py.stop(save=False)
 
 

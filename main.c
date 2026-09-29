@@ -56,6 +56,12 @@
  * added here: LCDC bit 4 is 0, so >= 128 aliases into the sprite tiles. */
 #define T_FONT       18
 
+/* The pop burst: 4 tiles, the 2x2 cell of a bubble, in the same LT/LB/RT/RB order
+ * (see build_bubble_gfx). 48 is the first id past the font -- T_FONT plus its 30
+ * glyphs -- and every id here has to stay below 128: LCDC bit 4 is 0, so 128 and
+ * up aliases into the sprite tiles. */
+#define T_BURST      48
+
 /* Sprite tile ids (8x16 mode: bubble colour c at c*4) */
 #define S_DOT        16
 
@@ -87,6 +93,18 @@
 #define FALL_SPEED   4            /* px per frame, same as a fired bubble */
 #define FALL_DELAY   4            /* frames between one floater starting and the next */
 
+/* The pop's beat: the whole matched cluster turns into a burst for this many
+ * frames before the first bubble goes, so a hit reads as the shape the player
+ * made rather than as bubbles blinking out. 6 is ~0.1s at 60Hz: long enough to
+ * register, short enough not to stall a board. This is the feel knob. */
+#define POP_FRAMES   6
+
+/* Combo scoring: consecutive shots that pop are worth more, the multiplier being
+ * the run length, capped here. The cap is not cosmetic -- the per-shot award is
+ * multiplied by it and the score is a uint16_t, so the cap is half of what keeps
+ * one award inside the type (see add_score()). */
+#define COMBO_MAX    8
+
 /* ---------------- fixed-point aim table ----------------
  * 12.4 fixed point (16 units = 1px), speed = 4px/frame = 64 units.
  * 15 deg (right) to 165 deg (left) in 10 deg steps, PLUS the exact vertical
@@ -112,6 +130,7 @@ static uint8_t  board[GRID_ROWS][GRID_COLS];   /* 0 = empty, else colour+1 */
 static uint8_t  parity;        /* toggles on every ceiling drop            */
 static uint8_t  level;
 static uint16_t score;         /* shown in the launcher strip by draw_score() */
+static uint8_t  combo;         /* shots in a row that popped; 0 after a dud shot */
 
 /* Which tile row of the BG map board row 0 sits on: even, 0..30, and always
  * stepping by 2 because a board row is 2 tile rows tall.  A ceiling drop walks
@@ -153,6 +172,7 @@ static uint8_t path_x[PATH_MAX], path_y[PATH_MAX];
 
 /* ---------------- graphics generation ---------------- */
 static uint8_t gfx[16 * 16];   /* 4 colours * 4 tiles * 16 bytes */
+static uint8_t burst_gfx[4 * 16];  /* the pop burst: 4 tiles, one cell */
 
 static const uint8_t wall_gfx[16] = {
     0xAA,0xFF, 0x55,0xFF, 0xAA,0xFF, 0x55,0xFF,
@@ -206,6 +226,45 @@ static void build_bubble_gfx(void)
                 }
 }
 
+/* Colour value (0-3) of pixel (px,py) of the pop burst. One glyph for every
+ * colour: this is the "this one is going" marker, not a bubble, so it is 4 tiles
+ * instead of 16. It keeps the bubble's circular silhouette and its dark outline,
+ * then fills the middle with a solid core and four diagonal arms -- the bubble
+ * reads as having cracked open on the spot rather than as something new. */
+static uint8_t burst_pixel(uint8_t px, uint8_t py)
+{
+    int8_t dx = (int8_t)(px * 2) - 15;     /* doubled coords, centre = 15 */
+    int8_t dy = (int8_t)(py * 2) - 15;
+    uint8_t ax = (uint8_t)(dx < 0 ? -dx : dx);
+    uint8_t ay = (uint8_t)(dy < 0 ? -dy : dy);
+    uint16_t d2 = (uint16_t)(dx * dx + dy * dy);
+
+    if (d2 > 225) return 0;                /* outside the circle: blank   */
+    if (d2 > 169) return 3;                /* ...its dark outline         */
+    if (d2 < 25)  return 3;                /* a solid core                */
+    return ((ax > ay ? (uint8_t)(ax - ay) : (uint8_t)(ay - ax)) < 4) ? 3 : 0;
+}
+
+/* Same expansion as build_bubble_gfx, in the same tile order: the burst is a
+ * cell like any other. */
+static void build_burst_gfx(void)
+{
+    uint8_t col, row, y, x, p, lo, hi;
+    uint8_t *out = burst_gfx;
+    for (col = 0; col < 2; col++)
+        for (row = 0; row < 2; row++)
+            for (y = 0; y < 8; y++) {
+                lo = hi = 0;
+                for (x = 0; x < 8; x++) {
+                    p  = burst_pixel((uint8_t)(col * 8 + x), (uint8_t)(row * 8 + y));
+                    lo = (uint8_t)((lo << 1) | (p & 1));
+                    hi = (uint8_t)((hi << 1) | (p >> 1));
+                }
+                *out++ = lo;
+                *out++ = hi;
+            }
+}
+
 /* ---------------- grid helpers ---------------- */
 static uint8_t cell_x(uint8_t r, uint8_t c)
 {
@@ -241,6 +300,16 @@ static uint8_t get_neighbours(uint8_t r, uint8_t c)
 }
 
 /* ---------------- drawing ---------------- */
+
+/* The one place a 2x2 cell is written to the map, so map_y0 is accounted for
+ * once. `t` is in set_bkg_tiles()' row-major order: top-left, top-right,
+ * bottom-left, bottom-right. */
+static void put_cell(uint8_t r, uint8_t c, const uint8_t *t)
+{
+    set_bkg_tiles((uint8_t)((FIELD_X >> 3) + (c << 1) + SHIFTED(r)),
+                  (uint8_t)((map_y0 + (r << 1)) & 31), 2, 2, t);
+}
+
 static void draw_cell(uint8_t r, uint8_t c)
 {
     uint8_t t[4];
@@ -254,8 +323,20 @@ static void draw_cell(uint8_t r, uint8_t c)
     } else {
         t[0] = t[1] = t[2] = t[3] = T_BLANK;
     }
-    set_bkg_tiles((uint8_t)((FIELD_X >> 3) + (c << 1) + SHIFTED(r)),
-                  (uint8_t)((map_y0 + (r << 1)) & 31), 2, 2, t);
+    put_cell(r, c, t);
+}
+
+/* The burst, on a cell that still holds a bubble: the pop's visible beat. Same
+ * cell, different tiles, so the board under it is untouched -- resolve() erases
+ * these cells for real a few frames later. */
+static void draw_burst(uint8_t r, uint8_t c)
+{
+    uint8_t t[4];
+    t[0] = T_BURST;
+    t[1] = (uint8_t)(T_BURST + 2);
+    t[2] = (uint8_t)(T_BURST + 1);
+    t[3] = (uint8_t)(T_BURST + 3);
+    put_cell(r, c, t);
 }
 
 static void draw_board(void)
@@ -434,12 +515,28 @@ static uint8_t drop_floating(void)
     return removed;
 }
 
+/* Add a shot's points, clamped. The score is a uint16_t and draw_score() shows
+ * five digits, so a wrapped total would display "00004" while the player has
+ * 65000-odd points -- the display lying about the score, which is worse than the
+ * score stopping. Escalating points made this reachable where flat ones never
+ * did: a full board of 64 in one pop is 1920, so this takes a few hundred pops
+ * at COMBO_MAX, and it is a ceiling rather than a crash either way. */
+static void add_score(uint16_t pts)
+{
+    uint16_t room = (uint16_t)(0xFFFFu - score);
+    score = (pts > room) ? 0xFFFF : (uint16_t)(score + pts);
+}
+
 /* Handle a newly placed bubble. Returns 1 if something popped. */
 static uint8_t resolve(uint8_t r, uint8_t c)
 {
     uint8_t n = flood_same(r, c);
     uint8_t i, idx, extra;
-    if (n < MIN_MATCH) return 0;
+
+    /* A shot that matched nothing ends the run. This is the combo's reset, along
+     * with the start of every board: `combo` is the count of shots IN A ROW that
+     * popped, so a dud is exactly what breaks one. */
+    if (n < MIN_MATCH) { combo = 0; return 0; }
 
     /* Once per resolve, not once per bubble. The loop below already vsync()s a
      * frame a bubble as the pop animation, and retriggering CH4 on each of those
@@ -448,6 +545,16 @@ static uint8_t resolve(uint8_t r, uint8_t c)
      * nothing is silent. */
     sfx_pop();
 
+    /* The beat: every bubble in the cluster bursts at once, for POP_FRAMES
+     * frames, before any of it goes. Drawn in one frame with no vsync between
+     * the cells, so the whole cluster flashes together -- the shape the player
+     * made -- rather than sweeping. The erase loop below is unchanged. */
+    for (i = 0; i < n; i++) {
+        idx = cluster[i];
+        draw_burst(idx >> 3, idx & 7);
+    }
+    wait_frames(POP_FRAMES);
+
     for (i = 0; i < n; i++) {
         idx = cluster[i];
         board[idx >> 3][idx & 7] = 0;
@@ -455,7 +562,12 @@ static uint8_t resolve(uint8_t r, uint8_t c)
         vsync();
     }
     extra = drop_floating();
-    score += (uint16_t)n * 10 + (uint16_t)extra * 20;
+
+    /* The multiplier is the run length, so the first pop of a run is worth
+     * exactly what it always was and each consecutive one is worth more. Capped:
+     * an uncapped counter would wrap to 0 at 256 and pay nothing. */
+    if (combo < COMBO_MAX) combo++;
+    add_score((uint16_t)(((uint16_t)n * 10 + (uint16_t)extra * 20) * combo));
     draw_score();
     return 1;
 }
@@ -685,6 +797,11 @@ static uint8_t play(void)
     cur  = pick_colour();
     next = pick_colour();
     pv_dirty = 1;            /* a new board: nothing cached against it is valid */
+    /* ...and the combo starts here rather than carrying over. The SCORE runs on
+     * across a level's boards; the combo is about the rhythm of one board, and a
+     * new board is a new puzzle -- carrying a run into it would pay a multiplier
+     * for a shot the player has not made yet. */
+    combo = 0;
 
     for (;;) {
         /* ---------- aim ---------- */
@@ -1067,10 +1184,12 @@ static void wait_or_skip(uint16_t frames)
 static void load_tiles(void)
 {
     build_bubble_gfx();
+    build_burst_gfx();
     /* tile 0 must be blank: the second half of dot_gfx is all zeroes */
     set_bkg_data(T_BLANK, 1, dot_gfx + 16);
     set_bkg_data(T_WALL, 1, wall_gfx);
     set_bkg_data(T_BUBBLE, 16, gfx);
+    set_bkg_data(T_BURST, 4, burst_gfx);
     set_sprite_data(0, 16, gfx);
     set_sprite_data(S_DOT, 2, dot_gfx);
     load_font();
