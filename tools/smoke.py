@@ -131,7 +131,6 @@ def check_font_order(path=None):
     return len(order)
 
 
-LOSE_ROW = 7                            # GRID_ROWS - 1: the row that loses the game
 
 
 def c_ternary_to_python(src):
@@ -219,14 +218,20 @@ def check_difficulty(path=None):
     src = open(path or os.path.join(HERE, os.pardir, "main.c")).read()
     rows = level_expr(src, r"init_board\(\(uint8_t\)\s*\((.*?)\)\);", "init_board")
     every = level_expr(src, r"drop_every\s*=\s*(.*?);", "drop_every")
+    # LOSE_ROW comes out of main.c as well. Hardcoding 7 here coupled the check to
+    # THIS file's grid: shrink GRID_ROWS in main.c and the losing row moves up, but
+    # a board one row too deep still passed, because 7 never moved.
+    grid = re.search(r"#define\s+GRID_ROWS\s+(\d+)", src)
+    assert grid, "main.c has no `#define GRID_ROWS`: update this check"
+    lose_row = int(grid.group(1)) - 1
 
     depths = [rows(lv) for lv in range(64)]
     gaps = [every(lv) for lv in range(64)]
     for lv, n in enumerate(depths):
-        assert 1 <= n <= LOSE_ROW - 2, \
+        assert 1 <= n <= lose_row - 2, \
             "level %d starts the pile %d rows deep: %d free row(s) above LOSE_ROW " \
             "(%d), and at least 2 are needed to play in" % (
-                lv, n, LOSE_ROW - n, LOSE_ROW)
+                lv, n, lose_row - n, lose_row)
     for lv, d in enumerate(gaps):
         assert d >= 4, \
             "level %d drops the ceiling every %d shots: a drop adds ~7.5 bubbles " \
@@ -236,6 +241,10 @@ def check_difficulty(path=None):
     assert len(set(gaps)) > 1, "the drop interval never changes: no ramp (%s)" % gaps[0]
     assert all(gaps[lv] >= gaps[lv + 1] for lv in range(63)), \
         "the drop interval goes back up with the level: %s" % gaps
+    # Shape as well as range: `(level > 1) ? 1 : ...` kept every depth inside the
+    # bound while making level 2 onward start with a single bubble, and passed.
+    assert all(depths[lv] <= depths[lv + 1] for lv in range(63)), \
+        "the starting pile gets shallower as the level rises: %s" % depths
     return "rows<=%d, drop every %d..%d shots" % (
         max(depths), min(gaps), max(gaps))
 
@@ -582,8 +591,16 @@ def first_press_fires(py, frames):
     redraw_all(), play()). LCDC reads off at the end of a frame only if DISPLAY_ON
     has not run yet, so anything pressed then is down before play() is reached.
 
-    The shot shows up as the launcher sprite leaving the strip: play() parks it at
-    OAM y 144 (LAUNCH_Y 136 + 8) and every frame of flight is above that.
+    The shot shows up as the launcher sprite leaving its parked row. The parked row
+    is MEASURED, not hardcoded: the first version watched `0 < OAM y < 144`, which
+    held only because LAUNCH_Y parks the launcher at 144, so raising LAUNCH_Y by a
+    tile put the parked sprite inside the watched window and the check passed on a
+    build with the bug put back.
+
+    Measuring it needs the board to have finished drawing first. The LCD is off when
+    we press, so the playfield count climbs 0 -> 112 -> 120 over the next two frames;
+    take the parked row before that settles and "the launcher moved" just means the
+    redraw finished, which is true of every build.
     """
     assert is_title(py), "not at the title screen: this would press into a game"
     frames(1, "start")                      # the title's own press, then released
@@ -594,10 +611,19 @@ def first_press_fires(py, frames):
     else:
         raise AssertionError("the board redraw never turned the LCD off")
     py.button_press("a")                    # held from here, never released
+    was = 0
+    for _ in range(60):                     # wait out the redraw, see the docstring
+        py.tick(1, True)
+        n = bubble_tiles(py)
+        if n and n == was:
+            break
+        was = n
+    else:
+        raise AssertionError("the board never finished drawing")
+    rest = py.memory[0xFE00]                # the launcher's row while aiming
     for _ in range(240):
         py.tick(1, True)
-        y = py.memory[0xFE00]
-        if 0 < y < 144:                     # the launcher sprite is in flight
+        if py.memory[0xFE00] != rest:       # it left: a shot is in flight
             py.button_release("a")
             return True
     py.button_release("a")
@@ -751,8 +777,11 @@ def main():
     walls = wall_count(py)
     assert walls == WALL_TILES, "walls not drawn: %d/%d tiles" % (walls, WALL_TILES)
 
-    start = bubble_tiles(py)
-    assert start >= 24, "starting board is empty (%d tiles)" % start
+    # Named for what it is: first_press_fires() has already fired a shot, so this
+    # is the board AFTER it landed, not the starting board. Nothing asserts the
+    # starting depth here -- check_difficulty() owns that, and it is a source check.
+    after_shot = bubble_tiles(py)
+    assert after_shot >= 24, "board is empty after the first shot (%d tiles)" % after_shot
 
     # The level readout, drawn by draw_level() at the start of every board. This is
     # the one point a headless run sees it from: nothing here clears a board, so the
@@ -772,13 +801,14 @@ def main():
     assert aim_up(py, frames), "the default aim is not straight up"
 
     # Fire a few shots; each should stick somewhere, so the board must change.
-    seen = {start}
+    seen = {after_shot}
     for _ in range(3):
         frames(6, "left")
         frames(3, "a")
         frames(70)
         seen.add(bubble_tiles(py))
-    assert len(seen) > 1, "board never changed after 3 shots (stuck at %d tiles)" % start
+    assert len(seen) > 1, \
+        "board never changed after 3 shots (stuck at %d tiles)" % after_shot
 
     # Floaters. A pop that strands bubbles must drop them: each floater leaves the
     # board as a sprite (FALL_SLOTS below) that travels DOWN the screen. The failure
@@ -857,9 +887,9 @@ def main():
     # this to happen on its own, so the state is forced.
     check_drop_keeps_colours(py, frames)
 
-    print("ok: sgb_border=%s walls=%d ramp=%s start_tiles=%d counts=%s score=%d "
+    print("ok: sgb_border=%s walls=%d ramp=%s after_shot=%d counts=%s score=%d "
           "drop_scy=%d mid=%d game_over->title=%d frames (A: %d)"
-          % (border, walls, ramp, start, sorted(seen), final_score, max(settled),
+          % (border, walls, ramp, after_shot, sorted(seen), final_score, max(settled),
              len(mid), gap, skip))
     py.stop(save=False)
 
