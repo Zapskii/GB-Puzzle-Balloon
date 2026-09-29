@@ -118,6 +118,16 @@ board lives on the BG layer. Rows alternate between 8 bubbles and 7 (shifted rig
 a ceiling drop pushes the rows down and toggles a parity flag rather than rewriting them,
 so always use the `SHIFTED()` / `ROW_COLS()` macros and never `r & 1`.
 
+A ceiling drop *slides* the board down rather than redrawing it, and that is why the launcher
+strip and the playfield are on different layers. The board walks up the 32-row tilemap
+(`map_y0`, always even) while `SCY` follows it down a pixel a frame, so the board's position
+on *screen* is the one thing that never changes — which is what lets `cell_y()`, `hit_test()`
+and `snap()` stay in plain screen coordinates. The strip is on the **window** layer, because
+the window is the one layer `SCY` does not scroll; on the BG the score would slide off the
+bottom of the screen with the board. Two consequences: draw the board only through
+`draw_cell()`, which knows about `map_y0`, and write the strip with `set_win_tiles` rather
+than `set_bkg_tiles`.
+
 Two hardware limits shape the rendering: BG tile ids must stay below 128, because LCDC.4
 is clear and anything higher aliases into the sprite tiles; and the DMG draws at most 10
 sprites per scanline, which is why the fall animation staggers its floaters.

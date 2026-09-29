@@ -9,7 +9,8 @@
  *   x 16..143  playfield  (8 bubbles * 16px)
  *   x 144..159 right wall (tiles 18-19)
  *   y 0..127   8 rows * 16px      (row 7 = "lose" row)
- *   y 128..143 launcher strip
+ *   y 128..143 launcher strip (window layer, so a ceiling drop can scroll
+ *              the playfield past it without dragging it along -- see main())
  *
  * Simplification: row pitch is 16px (2 tiles) so the grid stays tile-aligned.
  * Odd rows are shifted right by 8px (1 tile) and hold 7 bubbles, so the
@@ -99,6 +100,16 @@ static uint8_t  board[GRID_ROWS][GRID_COLS];   /* 0 = empty, else colour+1 */
 static uint8_t  parity;        /* toggles on every ceiling drop            */
 static uint8_t  level;
 static uint16_t score;         /* shown in the launcher strip by draw_score() */
+
+/* Which tile row of the BG map board row 0 sits on: even, 0..30, and always
+ * stepping by 2 because a board row is 2 tile rows tall.  A ceiling drop walks
+ * it up the map and scrolls SCY to match (see ceiling_drop), so the board's
+ * position on SCREEN is the invariant and never changes: screen row = row * 16,
+ * whatever map_y0 happens to be.  That is what lets cell_y(), hit_test() and
+ * snap() carry on in plain screen coordinates.  The map is 32 rows, the board
+ * uses 16, and the walk is mod 32 -- 32 * 8px = 256 = SCY's whole range, so it
+ * wraps with nothing to fix up. */
+static uint8_t  map_y0;
 
 /* A row's horizontal shift. Using a parity flag means a ceiling drop just
  * moves the rows down and toggles it: every existing row keeps its shift. */
@@ -221,15 +232,25 @@ static void draw_cell(uint8_t r, uint8_t c)
         t[0] = t[1] = t[2] = t[3] = T_BLANK;
     }
     set_bkg_tiles((uint8_t)((FIELD_X >> 3) + (c << 1) + SHIFTED(r)),
-                  (uint8_t)(r << 1), 2, 2, t);
+                  (uint8_t)((map_y0 + (r << 1)) & 31), 2, 2, t);
 }
 
 static void draw_board(void)
 {
     uint8_t r, c, n;
-    fill_bkg_rect(0, 0, 2, 18, T_WALL);
-    fill_bkg_rect(18, 0, 2, 18, T_WALL);
-    fill_bkg_rect(2, 0, 16, 18, T_BLANK);
+    /* The walls and the blank field cover all 32 map rows, not just the 18 the
+     * screen can show: a ceiling drop slides the view up two rows at a time, so
+     * every row of the map comes past the walls sooner or later. */
+    fill_bkg_rect(0, 0, 2, 32, T_WALL);
+    fill_bkg_rect(18, 0, 2, 32, T_WALL);
+    fill_bkg_rect(2, 0, 16, 32, T_BLANK);
+    /* The strip is the window layer, so it needs its own copy of the walls --
+     * without them the wall would stop 16px short of the bottom of the screen.
+     * Clearing the middle here is what also takes a just-finished game's score
+     * off the title screen when draw_board() runs for the title. */
+    fill_win_rect(0, 0, 20, 2, T_BLANK);
+    fill_win_rect(0, 0, 2, 2, T_WALL);
+    fill_win_rect(18, 0, 2, 2, T_WALL);
     for (r = 0; r < GRID_ROWS; r++) {
         n = ROW_COLS(r);
         for (c = 0; c < n; c++)
@@ -242,6 +263,8 @@ static void draw_score(void);          /* defined with the font, further down */
 static void redraw_all(void)
 {
     DISPLAY_OFF;
+    map_y0 = 0;             /* back to the top of the map */
+    SCY_REG = 0;            /* SCY is always map_y0 * 8 */
     draw_board();
     draw_score();
     DISPLAY_ON;
@@ -430,9 +453,26 @@ static uint8_t bottom_reached(void)
     return 0;
 }
 
+/* Push every row down one and add a fresh row at the top, then slide the board
+ * down into place.
+ *
+ * The slide is why the board lives on map rows that move. Rewriting the map --
+ * which is what this used to do, under DISPLAY_OFF -- flashes the whole screen
+ * black for the length of the rewrite. Instead the board walks up the 32-row map
+ * and the VIEW slides down it: the new row 0 is written into the two map rows
+ * that were one board row above the old row 0, which at this moment are two tile
+ * rows off the top of the screen, so the map can be written with the LCD running
+ * and nothing tears. SCY then walks those two rows into view a pixel a frame,
+ * and the board appears to move down. Nothing between here and the next drop
+ * depends on which map rows the board is on: screen position is what the rest of
+ * the game works in, and that is unchanged.
+ *
+ * SCY decreases to move content down.  It goes past 0 and wraps (the first drop
+ * takes it 0 -> 240), which is harmless: 32 map rows of 8px is exactly SCY's
+ * 256, so a wrapped SCY shows the same rows shifted, and the walk is mod 32. */
 static void ceiling_drop(void)
 {
-    uint8_t r, c, n;
+    uint8_t r, c, n, i, scy;
     for (r = GRID_ROWS - 1; r > 0; r--)
         memcpy(board[r], board[r - 1], GRID_COLS);
     parity ^= 1;
@@ -440,7 +480,19 @@ static void ceiling_drop(void)
     n = ROW_COLS(0);
     for (c = 0; c < n; c++)
         board[0][c] = (uint8_t)((rand() & 3) + 1);
-    redraw_all();
+
+    map_y0 = (uint8_t)((map_y0 - 2) & 31);
+    /* Blank the slot first: a shifted row only fills 7 of the 8 cells, and the
+     * map rows being reused here held a board row that is now elsewhere. */
+    fill_bkg_rect(2, map_y0, 16, 2, T_BLANK);
+    for (c = 0; c < n; c++)
+        if (board[0][c]) draw_cell(0, c);
+
+    scy = (uint8_t)((map_y0 << 3) + 16);        /* the view before this drop */
+    for (i = 0; i < 16; i++) {
+        vsync();
+        SCY_REG = (uint8_t)(scy - 1 - i);
+    }
 }
 
 static void init_board(uint8_t rows)
@@ -667,14 +719,27 @@ static void draw_text(uint8_t col, uint8_t row, const char *s)
     }
 }
 
-/* The launcher strip (BG rows 16-17) is the only free space on screen: the grid
- * owns rows 0-15 and the walls the outer columns. The sprites there -- the "next"
- * preview at x 32 and the launcher at x 80 -- leave cols 12-17 clear, so the score
- * is right-aligned against the wall. "SCORE" and the number are stacked rather
- * than side by side: eleven tiles will not fit in the six columns the sprites
- * leave free, but two 8px text rows stack into the 16px strip. */
+/* Same as draw_text(), but on the window layer. The score is the only thing
+ * that lives there (see the SCORE_ROW comment below). */
+static void draw_win_text(uint8_t col, uint8_t row, const char *s)
+{
+    uint8_t t;
+    while (*s) {
+        t = font_tile(*s++);
+        set_win_tiles(col++, row, 1, 1, &t);
+    }
+}
+
+/* The launcher strip is the only free space on screen: the grid owns the BG rows
+ * and the walls the outer columns. It is the first two rows of the WINDOW layer,
+ * which lands on screen rows 128-143 (see main() for why it is not on the BG).
+ * The sprites there -- the "next" preview at x 32 and the launcher at x 80 --
+ * leave cols 12-17 clear, so the score is right-aligned against the wall.
+ * "SCORE" and the number are stacked rather than side by side: eleven tiles will
+ * not fit in the six columns the sprites leave free, but two 8px text rows stack
+ * into the 16px strip. */
 #define SCORE_COL     12
-#define SCORE_ROW     16
+#define SCORE_ROW     0              /* window row, i.e. screen row 16 */
 #define SCORE_LABEL   "SCORE"
 #define SCORE_DIGITS  5              /* 65535 fits; the score is uint16_t */
 
@@ -685,14 +750,14 @@ static void draw_score(void)
     uint16_t v = score;
     int8_t i;
 
-    draw_text(SCORE_COL, SCORE_ROW, SCORE_LABEL);
+    draw_win_text(SCORE_COL, SCORE_ROW, SCORE_LABEL);
 
     s[SCORE_DIGITS] = 0;
     for (i = SCORE_DIGITS - 1; i >= 0; i--) {     /* five divides, once per shot */
         s[i] = (char)('0' + (v % 10));
         v /= 10;
     }
-    draw_text(SCORE_COL, SCORE_ROW + 1, s);
+    draw_win_text(SCORE_COL, SCORE_ROW + 1, s);
 }
 
 /* ---------------- title screen ---------------- */
@@ -725,12 +790,14 @@ static uint16_t title_screen(void)
             board[r][c] = (uint8_t)(((r + c) & 3) + 1);   /* diagonal banding */
     }
 
-    /* The text goes down inside the same display-off window as the board, and so
-     * does the strip below the grid: the score from a just-finished game lives
-     * there, and the title must not come back with it still hanging over it. */
+    /* The text goes down inside the same display-off window as the board. The
+     * strip below the grid is drawn by draw_board() too, and clearing it there is
+     * what stops the title coming back with a just-finished game's score still
+     * hanging over it. */
     DISPLAY_OFF;
+    map_y0 = 0;             /* the title always sits at the top of the map */
+    SCY_REG = 0;
     draw_board();
-    fill_bkg_rect(2, SCORE_ROW, 16, 2, T_BLANK);      /* launcher strip, walls kept */
     draw_text(3, 12, TITLE_NAME);
     draw_text(4, 14, TITLE_PROMPT);
     DISPLAY_ON;
@@ -786,6 +853,14 @@ static void load_tiles(void)
     load_font();
 }
 
+/* Both tile maps, cleared. The SGB border upload writes VRAM and leaves the map
+ * areas full of border tiles, so this runs again after it. */
+static void blank_maps(void)
+{
+    fill_bkg_rect(0, 0, 20, 32, T_BLANK);
+    fill_win_rect(0, 0, 20, 2, T_BLANK);
+}
+
 void main(void)
 {
     uint8_t won, i;
@@ -801,7 +876,18 @@ void main(void)
      * so clear the screen before turning the LCD back on: otherwise the wait
      * for START shows that logo (or uninitialised VRAM, on hardware that does
      * not zero it the way an emulator does) instead of a blank screen. */
-    fill_bkg_rect(0, 0, 20, 18, T_BLANK);
+    blank_maps();
+
+    /* The launcher strip goes on the window layer, which is the one layer SCY
+     * does not scroll. A ceiling drop slides the whole board down by scrolling
+     * SCY, and the strip has to stay put while that happens -- on the BG it
+     * would slide up into the playfield with everything else. Window rows 0-1
+     * land on screen rows 128-143, exactly the strip. The window map is 0x9C00
+     * and the playfield keeps the BG at 0x9800, so set_bkg_*() and set_win_*()
+     * address two different maps and neither disturbs the other. */
+    move_win(7, 128);                 /* WX 7 = flush left, WY 128 = the strip */
+    LCDC_REG |= LCDCF_WIN9C00;
+    SHOW_WIN;
 
     hide_all_sprites();
     SHOW_BKG;
@@ -820,7 +906,7 @@ void main(void)
                        (unsigned char *)border_data_map, sizeof(border_data_map),
                        (unsigned char *)border_data_palettes, sizeof(border_data_palettes));
         load_tiles();
-        fill_bkg_rect(0, 0, 20, 18, T_BLANK);
+        blank_maps();
     }
 
     /* A game is titles -> boards until it is lost -> back to the title, forever.

@@ -22,9 +22,10 @@ import sys
 
 from pyboy import PyBoy
 
-HERE = os.path.dirname(os.path.abspath(__file__))
-
-MAP = 0x9800            # BG map base (LCDC bit 3 clear)
+MAP = 0x9800            # BG map base (LCDC bit 3 clear): the playfield
+WIN_MAP = 0x9C00        # window map base (LCDC bit 6 set): the launcher strip
+SCY_REG = 0xFF42        # scroll Y: a ceiling drop slides the board with this
+LCDC_REG = 0xFF40
 WALL_TILES = 18 * 4     # both side walls, full height
 
 # The title screen's arch and text. Must match main.c.
@@ -35,7 +36,9 @@ FONT_ORDER = " ABCEIKLNOPRSTUYZ0123456789"   # glyph order, matches FONT_ORDER i
 TITLE_TEXT = [("PUZZLE BALLOON", 3, 12),  # string, tile column, tile row
               ("PRESS START", 4, 14)]
 SCORE_LABEL = "SCORE"                     # label row, then the digits under it
-SCORE_COL, SCORE_ROW, SCORE_DIGITS = 12, 16, 5
+SCORE_COL, SCORE_ROW, SCORE_DIGITS = 12, 0, 5   # rows are window rows, not screen
+
+HERE = os.path.dirname(os.path.abspath(__file__))
 
 
 def check_border_data(path=None):
@@ -142,7 +145,24 @@ def expected_title_map():
 
 
 def tile(py, col, row):
-    return py.memory[MAP + row * 32 + col]
+    """The tile at a SCREEN cell, following the scroll.
+
+    A ceiling drop slides the whole board down by scrolling SCY rather than
+    rewriting the map, so screen row r shows map row (SCY/8 + r) mod 32. Reading
+    the map row for row means this keeps working at any point in the walk. (It is
+    only exact when SCY is a multiple of 8 -- mid-slide the view is between map
+    rows -- so checks that care are made once a drop has settled.)
+    """
+    return py.memory[MAP + (((py.memory[SCY_REG] >> 3) + row) & 31) * 32 + col]
+
+
+def win_tile(py, col, row):
+    """The tile at a screen cell of the window layer -- the launcher strip.
+
+    The window is not scrolled, so this is a plain map read: window rows 0-1 sit
+    on screen rows 128-143.
+    """
+    return py.memory[WIN_MAP + row * 32 + col]
 
 
 T_ZERO = T_FONT + FONT_ORDER.index("0")
@@ -153,14 +173,16 @@ def score(py):
 
     "SCORE" sits on the row above the number, zero-padded and right-aligned in the
     launcher strip, so a wrong width, a missing label or a stray tile shows up here
-    rather than as a silently wrong number.
+    rather than as a silently wrong number. The strip is the window layer, so this
+    is also the check that set_win_tiles() really addressed the window map: if it
+    wrote the BG one instead, the strip would read blank here.
     """
     want = [T_FONT + FONT_ORDER.index(ch) for ch in SCORE_LABEL]
-    if [tile(py, c, SCORE_ROW) for c in range(SCORE_COL, SCORE_COL + len(SCORE_LABEL))] != want:
+    if [win_tile(py, c, SCORE_ROW) for c in range(SCORE_COL, SCORE_COL + len(SCORE_LABEL))] != want:
         return None
     n = 0
     for c in range(SCORE_COL, SCORE_COL + SCORE_DIGITS):
-        t = tile(py, c, SCORE_ROW + 1)
+        t = win_tile(py, c, SCORE_ROW + 1)
         if not T_ZERO <= t <= T_ZERO + 9:
             return None
         n = n * 10 + (t - T_ZERO)
@@ -176,7 +198,13 @@ def bubble_tiles(py):
 def is_title(py):
     """True when every one of the 20x18 tiles matches the title screen."""
     want = expected_title_map()
-    return all(tile(py, c, r) == want[r][c] for r in range(18) for c in range(20))
+    if not all(tile(py, c, r) == want[r][c] for r in range(18) for c in range(20)):
+        return False
+    # ...and when the launcher strip is empty. The title leaves it blank except
+    # for the walls, which the window layer has to draw itself, and a strip that
+    # was not cleared is exactly what a game over used to leave behind.
+    return all(win_tile(py, c, r) == (1 if c in (0, 1, 18, 19) else 0)
+               for r in range(2) for c in range(20))
 
 
 def game_over_to_title(py, frames, shot_budget=60, skip=False):
@@ -282,6 +310,62 @@ def fall_watch(py, frames):
     return False
 
 
+def drop_watch(py, frames, shots=30):
+    """Fire shots until a ceiling drop has settled; return the (SCY, LCDC) samples.
+
+    The ceiling drop slides the board down by scrolling SCY instead of rewriting
+    the map with the LCD off, which is what used to make it flash. Two things
+    follow, and both are visible from the two registers alone:
+
+      * SCY does not stay 0. The board walks up the 32-row map, so after a drop
+        SCY is map_y0 * 8 and stays there -- nonzero until the walk wraps.
+      * On the way it is NOT a multiple of 8, because the slide moves one pixel
+        a frame, and the LCD is still on for every one of those frames.
+
+    Putting the redraw back would leave SCY at 0 and the LCD briefly off, so both
+    halves of this fail. Frames are sampled one at a time: the slide is 16 long
+    and a 60-frame window after each shot covers it. Returning as soon as SCY has
+    stopped moving means the caller sees the board exactly as the drop left it --
+    which is when the new top row can be checked where it should be. ("Stopped"
+    and not "a multiple of 8": a 16px slide passes over a tile boundary on the
+    way, so one of its frames is tile-aligned too.)
+
+    The budget is shots, not frames, and generous: a drop only comes every
+    drop_every shots of ONE game, and losing mid-window restarts the count.
+    """
+    seen, slid, prev = [], False, None
+    for _ in range(shots):
+        frames(6, "left")
+        frames(3, "a")
+        for _ in range(60):
+            py.tick(1, True)
+            scy, lcdc = py.memory[SCY_REG], py.memory[LCDC_REG]
+            seen.append((scy, lcdc))
+            if scy % 8:
+                slid = True
+            elif slid and scy and scy == prev:
+                return seen
+            prev = scy
+        # Harmless during play; restarts the game if the board filled up.
+        frames(1, "start")
+    return seen
+
+
+def strip_visible(py):
+    """Pixels where the score's digits are, i.e. is the window layer showing?
+
+    The digits are only in the window map -- the BG rows behind the strip are
+    blank in the middle -- so ink at the digit cells proves the window is both
+    enabled and sitting where the strip should be (WY 128, WX 7). Tiles alone
+    cannot show that: set_win_tiles() would happily fill a map that is never
+    displayed. The digits are window row 1, i.e. screen rows 136-143, x 96-135;
+    that is clear of the launcher sprite at x 80-95. Blank is white (255 on every
+    channel), and the font is written in colour 3, the darkest shade.
+    """
+    screen = py.screen.ndarray
+    return bool((screen[136:144, 96:136, 0] < 200).any())
+
+
 def main():
     rom = sys.argv[1] if len(sys.argv) > 1 else "bubble.gb"
     border = check_border_data()
@@ -361,8 +445,8 @@ def main():
     # five digits; it must then move when bubbles pop. Which shot lands a match is
     # not predictable, so keep firing until one does.
     assert score(py) is not None, "score field is not SCORE + five digits (tiles %s / %s)" % \
-        ([tile(py, c, SCORE_ROW) for c in range(SCORE_COL, SCORE_COL + SCORE_DIGITS)],
-         [tile(py, c, SCORE_ROW + 1) for c in range(SCORE_COL, SCORE_COL + SCORE_DIGITS)])
+        ([win_tile(py, c, SCORE_ROW) for c in range(SCORE_COL, SCORE_COL + SCORE_DIGITS)],
+         [win_tile(py, c, SCORE_ROW + 1) for c in range(SCORE_COL, SCORE_COL + SCORE_DIGITS)])
 
     for _ in range(25):
         if score(py):
@@ -376,6 +460,37 @@ def main():
         py.button_release("start")
     assert score(py), "score never moved"
     final_score = score(py)            # the strip is blank again once the title is back
+
+    # The strip is the window layer, and the digits are in the window map only, so
+    # ink where the digits are is what proves the window is on screen at all.
+    assert strip_visible(py), "the score strip is not showing (window layer off screen?)"
+
+    # The ceiling drop. It slides the board down by scrolling SCY instead of
+    # rewriting the map under DISPLAY_OFF, which is what used to flash black. See
+    # drop_watch(): SCY must leave 0, because the board walks up the map rather
+    # than being rewritten, and be caught mid-slide at a non-multiple of 8 -- one
+    # pixel a frame -- with the LCD still on for every one of those frames.
+    drops = drop_watch(py, frames)
+    mid = [lcdc for scy, lcdc in drops if scy % 8]
+    seq = [scy for scy, _ in drops]
+    # Settled = a value held over two frames in a row. Mid-slide SCY changes every
+    # frame, so nothing else can produce that -- and one frame of a 16px slide does
+    # fall on a tile boundary, so "tile aligned" on its own would not do.
+    settled = {scy for i, scy in enumerate(seq) if i and scy == seq[i - 1]}
+    assert any(seq), "SCY never left 0: a ceiling drop redrew the map instead of sliding it"
+    assert mid, "SCY was never caught mid-slide: the drop did not slide"
+    assert all(lcdc & 0x80 for lcdc in mid), \
+        "the LCD was off mid-slide: that is the flash the slide is meant to replace"
+    # A settled SCY is map_y0 * 8, and map_y0 is always even -- a board row is two
+    # map rows tall, so an odd map_y0 would put half a bubble across the map wrap.
+    assert all(scy % 16 == 0 for scy in settled), \
+        "a settled SCY is not a multiple of 16: map_y0 is no longer even"
+    # The drop has just added a row at the top of the board, and it must be drawn
+    # at the top of the SCREEN. The flight and the board live in different
+    # coordinate spaces -- pixels vs map_y0 plus SCY -- and reading the new row
+    # through tile(), which follows the scroll, is what says the two agree.
+    assert any(2 <= tile(py, c, r) <= 17 for r in (0, 1) for c in range(2, 18)), \
+        "no bubbles at the top of the screen right after a drop: board and scroll disagree"
 
     # Game over must hand back to the title screen by itself, and must not leave
     # the finished game's score hanging over it (is_title() covers the strip).
@@ -391,8 +506,9 @@ def main():
         "A did not cut the game-over hold short (%s frames)" % skip
 
     print("ok: sgb_border=%s walls=%d start_tiles=%d counts=%s score=%d "
-          "game_over->title=%d frames (A: %d)"
-          % (border, walls, start, sorted(seen), final_score, gap, skip))
+          "drop_scy=%d mid=%d game_over->title=%d frames (A: %d)"
+          % (border, walls, start, sorted(seen), final_score, max(settled),
+             len(mid), gap, skip))
     py.stop(save=False)
 
 
