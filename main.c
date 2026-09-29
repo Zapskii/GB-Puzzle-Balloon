@@ -59,6 +59,17 @@
 #define SPR_NEXT     2
 #define SPR_DOT      4
 #define NUM_DOTS     3
+#define SPR_FALL     8            /* floaters, 2 sprites each: 8 .. 8+2*FALL_MAX-1 */
+
+/* Floating bubbles fall off the bottom as sprites rather than blinking out.
+ * Sprites because the BG grid only moves in 16px steps and this should read as
+ * gravity. Starts are staggered: a whole row of floaters shares one cell_y, and
+ * the hardware draws only 10 sprites per scanline, so they must not all occupy
+ * the same rows at once. FALL_MAX is what the free sprite slots allow (slots
+ * 0-6 are the launcher, next bubble and aim dots, of 40). */
+#define FALL_MAX     12
+#define FALL_SPEED   4            /* px per frame, same as a fired bubble */
+#define FALL_DELAY   4            /* frames between one floater starting and the next */
 
 /* ---------------- fixed-point aim table ----------------
  * 12.4 fixed point (16 units = 1px), speed = 4px/frame = 64 units.
@@ -90,6 +101,12 @@ static uint8_t visited[GRID_ROWS][GRID_COLS];
 static uint8_t stack[GRID_ROWS * GRID_COLS];
 static uint8_t cluster[GRID_ROWS * GRID_COLS];
 static uint8_t nb_r[6], nb_c[6];
+
+/* what is currently falling: where each floater came from, its colour, and how
+ * many frames it stays on screen (which depends on how far it has to drop) */
+static uint8_t fall_cells[FALL_MAX];
+static uint8_t fall_colour[FALL_MAX];
+static uint8_t fall_frames[FALL_MAX];
 
 /* ---------------- graphics generation ---------------- */
 static uint8_t gfx[16 * 16];   /* 4 colours * 4 tiles * 16 bytes */
@@ -263,6 +280,54 @@ static uint8_t flood_same(uint8_t r, uint8_t c)
     return count;
 }
 
+/* Drop the n recorded floaters off the bottom of the screen.
+ *
+ * Each one keeps its board cell until its sprite takes over, so nothing ever
+ * blinks out: the bubble stays put, a sprite appears over it at the same spot,
+ * the cell is cleared underneath, and the sprite falls from there. */
+#define FALL_EXIT_Y  152          /* fully clear of the 144px screen by here */
+
+static void animate_fall(uint8_t n)
+{
+    uint8_t k, t, total = 0;
+
+    if (!n) return;
+
+    for (k = 0; k < n; k++) {
+        uint8_t r = (uint8_t)(fall_cells[k] >> 3);
+        uint8_t f = (uint8_t)(((FALL_EXIT_Y - cell_y(r)) / FALL_SPEED) + 1);
+        fall_frames[k] = f;
+        if (f > total) total = f;                 /* the slowest one's flight */
+    }
+    total = (uint8_t)(total + (n - 1) * FALL_DELAY);
+
+    for (t = 0; t < total; t++) {
+        for (k = 0; k < n; k++) {
+            uint8_t start = (uint8_t)(k * FALL_DELAY);
+            uint8_t spr   = (uint8_t)(SPR_FALL + (k << 1));
+            uint8_t r     = (uint8_t)(fall_cells[k] >> 3);
+            uint8_t c     = (uint8_t)(fall_cells[k] & 7);
+            uint8_t age;
+
+            if (t < start) continue;              /* still on the board */
+            age = (uint8_t)(t - start);
+
+            if (age == 0) {                       /* the sprite takes over */
+                board[r][c] = 0;
+                draw_cell(r, c);
+            }
+            if (age >= fall_frames[k]) {
+                move_sprite(spr, 0, 0);
+                move_sprite((uint8_t)(spr + 1), 0, 0);
+                continue;
+            }
+            place_bubble_sprite(spr, fall_colour[k], cell_x(r, c),
+                                (uint8_t)(cell_y(r) + age * FALL_SPEED));
+        }
+        vsync();
+    }
+}
+
 /* Remove everything not connected to the ceiling. Returns number removed. */
 static uint8_t drop_floating(void)
 {
@@ -287,17 +352,24 @@ static uint8_t drop_floating(void)
         }
     }
 
+    /* Record the floaters rather than erasing them here: animate_fall clears each
+     * cell at the moment its sprite takes over. Anything past FALL_MAX has no
+     * sprite slot to spare, so it is simply removed. */
     for (r = 0; r < GRID_ROWS; r++) {
         n = ROW_COLS(r);
         for (c = 0; c < n; c++) {
-            if (board[r][c] && !visited[r][c]) {
+            if (!board[r][c] || visited[r][c]) continue;
+            if (removed < FALL_MAX) {
+                fall_cells[removed]  = (uint8_t)((r << 3) | c);
+                fall_colour[removed] = (uint8_t)(board[r][c] - 1);
+            } else {
                 board[r][c] = 0;
                 draw_cell(r, c);
-                removed++;
-                vsync();                 /* one per frame = cheap "fall" effect */
             }
+            removed++;
         }
     }
+    animate_fall(removed < FALL_MAX ? removed : (uint8_t)FALL_MAX);
     return removed;
 }
 

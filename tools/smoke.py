@@ -74,6 +74,34 @@ def wall_count(py):
                if tile(py, c, r) == 1)
 
 
+# The fall animation's sprite slots: 2 sprites per floater, from SPR_FALL up.
+# Slots 0-7 are the launcher, the next bubble and the aim dots. Must match main.c.
+FALL_SLOTS = list(range(8, 8 + 2 * 12))
+
+
+def fall_watch(py, frames):
+    """Fire one shot; report whether a floater sprite was seen moving DOWN.
+
+    A hidden sprite reads Y=0, so any slot in FALL_SLOTS with a non-zero Y is a
+    floater on screen, and a fall is that Y increasing frame to frame.
+    """
+    frames(6, "left")
+    frames(3, "a")
+    prev = [py.memory[0xFE00 + s * 4] for s in FALL_SLOTS]
+    for _ in range(150):
+        py.tick(1, True)
+        cur = [py.memory[0xFE00 + s * 4] for s in FALL_SLOTS]
+        if any(c and p and c > p for c, p in zip(cur, prev)):
+            return True
+        prev = cur
+    # Tap START after a dry shot: harmless during play, and it restarts the game
+    # if the board filled up and main() is sitting on the title screen again.
+    py.button_press("start")
+    py.tick(1, True)
+    py.button_release("start")
+    return False
+
+
 def main():
     rom = sys.argv[1] if len(sys.argv) > 1 else "bubble.gb"
     py = PyBoy(rom, window="null", sound_emulated=False)
@@ -135,6 +163,13 @@ def main():
         frames(70)
         seen.add(bubble_tiles(py))
     assert len(seen) > 1, "board never changed after 3 shots (stuck at %d tiles)" % start
+
+    # Floaters. A pop that strands bubbles must drop them: each floater leaves the
+    # board as a sprite (FALL_SLOTS below) that travels DOWN the screen. The failure
+    # this catches is a sprite parked at its old cell, or one that blinks out.
+    # Which shot strands bubbles is not predictable, so fire until one does.
+    assert any(fall_watch(py, frames) for _ in range(40)), \
+        "no floater was seen falling after 40 shots"
 
     print("ok: walls=%d start_tiles=%d counts=%s" % (walls, start, sorted(seen)))
     py.stop(save=False)
