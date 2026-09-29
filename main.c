@@ -65,6 +65,17 @@
 #define SPR_DOT      4
 #define NUM_DOTS     3
 #define SPR_FALL     8            /* floaters, 2 sprites each: 8 .. 8+2*FALL_MAX-1 */
+#define SPR_MARK     32           /* landing marker: 2 slots, so an even base */
+
+/* The aim preview's walk along the shot's path. PATH_MAX is how much of it is
+ * kept for the dots, and it is also longer than any real flight: the shallowest
+ * aim (ANG_DY -17, 1.06px a frame) needs 121 frames to climb from LAUNCH_Y to the
+ * ceiling at y 8, which ends every flight that meets no bubble first. The marker
+ * comes from the walk's own last position rather than from the array, so a longer
+ * path would cost dots, not a lie. PV_BUDGET is the walk's per-frame slice; see
+ * preview_step() for why it is sliced at all. */
+#define PATH_MAX     128
+#define PV_BUDGET    4
 
 /* Floating bubbles fall off the bottom as sprites rather than blinking out.
  * Sprites because the BG grid only moves in 16px steps and this should read as
@@ -128,6 +139,17 @@ static uint8_t nb_r[6], nb_c[6];
 static uint8_t fall_cells[FALL_MAX];
 static uint8_t fall_colour[FALL_MAX];
 static uint8_t fall_frames[FALL_MAX];
+
+/* The aim preview: the walk along the shot's own path, and where it has got to.
+ * Walked over several frames rather than all at once -- see preview_step(). */
+static uint8_t pv_ang;                  /* the angle the walk belongs to */
+static uint8_t pv_dirty = 1;            /* the board changed: start a new walk */
+static uint8_t pv_done;                 /* the walk reached the shot's stop */
+static uint8_t pv_n;                    /* path points recorded so far */
+static int16_t pv_fx, pv_fy;            /* the walk's position, 12.4 fixed point */
+static int16_t pv_dx, pv_dy;
+static uint8_t mark_x, mark_y, mark_ok;
+static uint8_t path_x[PATH_MAX], path_y[PATH_MAX];
 
 /* ---------------- graphics generation ---------------- */
 static uint8_t gfx[16 * 16];   /* 4 colours * 4 tiles * 16 bytes */
@@ -564,6 +586,79 @@ static uint8_t snap(uint8_t cx, uint8_t cy, uint8_t *pr, uint8_t *pc)
     return found;
 }
 
+/* ---------------- aim preview ----------------
+ * The aim dots ride the REAL flight path and the marker sits on the cell the shot
+ * will come to rest in. Both come from the same fixed-point step and the same
+ * hit_test() and snap() the shot itself uses; a preview that disagrees with the
+ * shot is worse than no preview, so the step below is a deliberate copy of the fly
+ * loop's rather than an approximation of it. tools/smoke.py fires the shot and
+ * checks the marker is where the bubble actually stopped, which is what catches
+ * the two drifting apart.
+ *
+ * The walk is expensive: hit_test() scans three rows of up to eight occupied cells
+ * and the shallowest shot is 121 steps of it -- measured on this build at roughly
+ * 0.12 frames a step, so ~13 frames for that one. Doing it all in the frame the aim
+ * moves is the obvious thing and it visibly stalls the game: the aim key repeat
+ * steps every 3 frames, so the player steering would drop to a quarter speed. It
+ * is walked in PV_BUDGET slices, once a frame, which keeps the aim loop's 60Hz
+ * tick intact; the preview then converges a few frames after the aim stops moving.
+ *
+ * The dots are placed from however much path exists so far, so they reach out from
+ * the launcher and settle. The marker only appears once the walk has actually
+ * found the stopping point: until then there is nothing honest to draw.
+ *
+ * The dots go at a quarter, a half and three quarters of the path rather than at
+ * the first three frames as they used to. That is what lets the preview show a
+ * bounce at all -- the nearest wall is 56px from the launcher, so the first ~14
+ * frames of any shot are straight, and dots that hug the launcher look identical
+ * whether or not the rest of the path bounces. The spacing is in shifts because
+ * (i+1)*n overflows a uint8_t; all three indices are <= n-1 for any n >= 1. */
+
+/* Start a walk for `ang` at the launcher. */
+static void preview_reset(uint8_t ang)
+{
+    pv_fx   = (int16_t)LAUNCH_X << 4;
+    pv_fy   = (int16_t)LAUNCH_Y << 4;
+    pv_dx   = ANG_DX[ang];
+    pv_dy   = ANG_DY[ang];
+    pv_ang  = ang;
+    pv_n    = 0;
+    pv_done = 0;
+    mark_ok = 0;                 /* no landing point until one is found */
+}
+
+/* One slice of the walk. Called once a frame from the aim loop. */
+static void preview_step(void)
+{
+    uint8_t k = PV_BUDGET, cx = 0, cy = 0, r = 0, c = 0;
+
+    if (pv_done) return;
+    while (k--) {
+        pv_fx += pv_dx;
+        pv_fy += pv_dy;
+        if (pv_fx < WALL_L * 16)      { pv_fx = WALL_L * 32 - pv_fx; pv_dx = -pv_dx; }
+        else if (pv_fx > WALL_R * 16) { pv_fx = WALL_R * 32 - pv_fx; pv_dx = -pv_dx; }
+        cx = (uint8_t)(pv_fx >> 4);
+        if (pv_fy < 8 * 16) { cy = 8; pv_done = 1; }         /* ceiling */
+        else { cy = (uint8_t)(pv_fy >> 4); pv_done = hit_test(cx, cy); }
+        if (pv_n < PATH_MAX) {
+            path_x[pv_n] = cx;
+            path_y[pv_n] = cy;
+            pv_n++;
+        }
+        if (pv_done) {
+            /* snap(), and only snap(): that is what stops the marker and the shot
+             * ever disagreeing about the landing cell. */
+            mark_ok = snap(cx, cy, &r, &c);
+            if (mark_ok) {
+                mark_x = cell_x(r, c);
+                mark_y = cell_y(r);
+            }
+            break;
+        }
+    }
+}
+
 /* ---------------- one round of play ---------------- */
 /* returns 1 = level cleared, 0 = game over */
 static uint8_t play(void)
@@ -584,11 +679,12 @@ static uint8_t play(void)
      * shots take 9 off, so at 3 the pile grows faster than a good player can clear
      * it. The ramp stays -- one shot fewer per level down to the floor. */
     uint8_t drop_every = (level >= 4) ? 4 : (uint8_t)(8 - level);
-    uint8_t i, hit, r, c, mask;
+    uint8_t i, k, hit, r, c, mask;
     int16_t fx, fy, fdx, fdy, cx, cy;
 
     cur  = pick_colour();
     next = pick_colour();
+    pv_dirty = 1;            /* a new board: nothing cached against it is valid */
 
     for (;;) {
         /* ---------- aim ---------- */
@@ -604,15 +700,32 @@ static uint8_t play(void)
                 if (++rep >= 3) rep = 0;
             } else rep = 0;
 
+            /* The walk is restarted when the aim moves, or when the board changed
+             * under a stale one (a shot or a ceiling drop); otherwise it just
+             * carries on where it left off. See preview_step(). */
+            if (pv_dirty || ang != pv_ang) {
+                preview_reset(ang);
+                pv_dirty = 0;
+            }
+            preview_step();
+
             place_bubble_sprite(SPR_FLY,  cur,  LAUNCH_X, LAUNCH_Y);
             place_bubble_sprite(SPR_NEXT, next, NEXT_X,   NEXT_Y);
+            /* The dots sit on the walked path, quarter/half/three quarters along
+             * however much of it there is; they settle as the walk finishes. The
+             * offsets are the ones the dots have always been drawn at. */
             for (i = 0; i < NUM_DOTS; i++) {
-                int16_t n = (int16_t)(i + 1) * 4;
-                uint8_t px = (uint8_t)(LAUNCH_X + ((ANG_DX[ang] * n) >> 4));
-                uint8_t py = (uint8_t)(LAUNCH_Y + ((ANG_DY[ang] * n) >> 4));
+                k = (i == 0) ? (uint8_t)(pv_n >> 2)
+                  : (i == 1) ? (uint8_t)(pv_n >> 1)
+                             : (uint8_t)((pv_n >> 1) + (pv_n >> 2));
                 set_sprite_tile(SPR_DOT + i, S_DOT);
-                move_sprite(SPR_DOT + i, (uint8_t)(px + 4), (uint8_t)(py + 12));
+                move_sprite(SPR_DOT + i, (uint8_t)(path_x[k] + 4),
+                                         (uint8_t)(path_y[k] + 12));
             }
+            /* Where this shot will come to rest, in its colour -- once the walk
+             * knows, and not before. */
+            if (mark_ok) place_bubble_sprite(SPR_MARK, cur, mark_x, mark_y);
+            else { move_sprite(SPR_MARK, 0, 0); move_sprite(SPR_MARK + 1, 0, 0); }
 
             if ((keys & (J_A | J_B)) && !(prev & (J_A | J_B))) {
                 prev = keys;
@@ -624,6 +737,13 @@ static uint8_t play(void)
 
         /* ---------- fly ---------- */
         for (i = 0; i < NUM_DOTS; i++) move_sprite(SPR_DOT + i, 0, 0);
+        /* The marker too: it is a bubble's worth of tiles, and one left sitting on
+         * the board through the flight, the pop or the drop's slide would read as
+         * a real bubble. */
+        move_sprite(SPR_MARK, 0, 0);
+        move_sprite(SPR_MARK + 1, 0, 0);
+        /* ...and the board is about to change, so the cached preview is stale. */
+        pv_dirty = 1;
         place_bubble_sprite(SPR_NEXT, next, NEXT_X, NEXT_Y);
 
         fx  = (int16_t)LAUNCH_X << 4;

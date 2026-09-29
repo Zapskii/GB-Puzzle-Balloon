@@ -572,6 +572,157 @@ def aim_up(py, frames):
     return seen
 
 
+# --- aim preview ---
+DOT_SLOTS = (4, 5, 6)           # the aim dots; sprite slot, x/y at 0xFE00 + 4*slot
+MARK_SLOTS = (32, 33)           # the landing marker: a bubble, so two slots
+
+
+def oam(py, slot):
+    """A sprite's OAM x,y. y == 0 means hidden."""
+    return py.memory[0xFE01 + slot * 4], py.memory[0xFE00 + slot * 4]
+
+
+def aim_tables(path=None):
+    """LAUNCH_X/LAUNCH_Y and the angle table, out of main.c.
+
+    Read rather than repeated: the ray this check measures the dots against IS the
+    ANG_DX/ANG_DY pair, so hardcoding a copy here would let the check drift away
+    from the thing it is checking.
+    """
+    src = open(path or os.path.join(HERE, os.pardir, "main.c")).read()
+
+    def num(name):
+        m = re.search(r"#define\s+%s\s+(\d+)" % name, src)
+        assert m, "main.c has no `#define %s`: update this check" % name
+        return int(m.group(1))
+
+    def table(name):
+        m = re.search(r"%s\[NUM_ANGLES\]\s*=\s*\{(.*?)\};" % name, src, re.S)
+        assert m, "main.c has no %s[NUM_ANGLES]" % name
+        return [int(v) for v in re.findall(r"-?\d+", m.group(1))]
+
+    return num("LAUNCH_X"), num("LAUNCH_Y"), table("ANG_DX"), table("ANG_DY")
+
+
+def check_aim_preview(py, frames, path=None):
+    """The aim preview has to follow the REAL, wall-bouncing path.
+
+    Before this, the dots were three points along a straight ray from the launcher
+    (`LAUNCH + ANG_D * n`, n = (i+1)*4 fixed-point units), so at every angle whose
+    shot bounces the preview pointed somewhere the shot never goes. The launcher is
+    64px from either wall and the fastest a shot closes that is 3.9px a frame -- the
+    15-degree aim, which is also the one that reaches a wall soonest -- so no shot
+    can have bounced within its first ~16 frames: dots at the first three frames,
+    where the old preview put them, cannot show a bounce at all. That is why they
+    moved to a quarter/half/three quarters of the path, and it is why this check has
+    to read the outermost dot rather than the nearest one.
+
+    Two claims, and both are about the preview agreeing with the shot:
+
+      * At the shallowest aim (the far right stop, 15 degrees) the outermost dot is
+        nowhere near the straight ray. Measured as the perpendicular distance from
+        the ray, NOT as a distance from where the old formula put its dot: the old
+        formula drew dots one, two and three frames out, so a build spreading dots
+        along a straight ray would differ from it too, and a position-only check
+        would pass on a preview that still ignores bounces. The perpendicular
+        distance is zero for any point on the ray, however it is spaced.
+
+      * The marker is the cell the shot actually lands in. That is the check that
+        the preview and the shot did not drift apart: the game calls the same
+        snap(), so the marker has to be within one cell (16px) of where the flight
+        stopped, and the cell it points at has to be empty on the board.
+
+    Plus, both must be off screen through the flight and back afterwards: the marker
+    is a bubble's worth of tiles, so one left standing through the flight or the pop
+    would read as a real bubble on the board, and one that never comes back would
+    mean the preview is simply gone.
+    """
+    lx, ly, adx, ady = aim_tables(path)
+    # The shallowest rightward aim: the largest ANG_DX, which is the one that
+    # reaches the right wall soonest and so the one a straight ray lies about most.
+    ang = max(range(len(adx)), key=lambda i: adx[i])
+    assert adx[ang] > 0, "no rightward aim in ANG_DX: update this check"
+    parked = ly + 8                      # the launcher's OAM y while it is parked
+
+    # Steer to that stop. The key repeat needs 3 frames an aim step and the sweep
+    # does not wrap, so holding it is free -- and the preview then needs a few more
+    # frames to finish walking the path (it is deliberately sliced per frame, see
+    # preview_step() in main.c). Waiting for the marker is how this knows the walk
+    # has stopped and the dots are final; a build with no marker walks nothing, so
+    # it just times out here and the dot assertion below still gets read -- which is
+    # the one that has to fire on a build that draws the straight ray.
+    frames(60, "right")
+    for _ in range(150):
+        py.tick(1, True)
+        if any(py.memory[0xFE00 + s * 4] for s in MARK_SLOTS):
+            break
+    ox, oy = oam(py, DOT_SLOTS[-1])
+    assert ox and oy, "the aim dots are not on screen at the far right stop"
+
+    # OAM to screen pixels: the dot sprite is centred on the point it marks (the
+    # +4/+12 in the aim loop), so px = x-4, py = y-12.
+    px, py_ = ox - 4, oy - 12
+    dx, dy = adx[ang] / 16.0, ady[ang] / 16.0       # px per flight frame
+    # Perpendicular distance from the straight ray through the launcher.
+    cross = dx * (py_ - ly) - dy * (px - lx)
+    off = abs(cross) / (dx * dx + dy * dy) ** 0.5
+    assert off > 8, \
+        "the outermost aim dot is %.1fpx off the straight ray from the launcher " \
+        "(dot at %d,%d; launcher %d,%d; ray %.2f,%.2f px/frame): the preview is " \
+        "drawing the straight line and ignoring wall bounces" \
+        % (off, px, py_, lx, ly, dx, dy)
+
+    # ...and it is not merely somewhere else on the ray: the shot at this angle
+    # crosses the right wall, so the dot has to be back inside the playfield.
+    assert 16 <= px <= 144, \
+        "the outermost aim dot is at x=%d, outside the playfield: the preview is " \
+        "not reflecting off the walls at all" % px
+
+    # The marker: on a cell centre, on a cell the board says is empty. A cell centre
+    # is a multiple of 8 in x (the two row parities sit 8px apart) and of 16 in y,
+    # plus 8 because place_bubble_sprite writes the centre y through OAM's own +8.
+    mx, my = oam(py, MARK_SLOTS[0])
+    assert mx and my, "no landing marker at the far right stop: nothing shows where " \
+                      "the shot will rest"
+    assert mx % 8 == 0 and my % 16 == 0, \
+        "the landing marker is at %d,%d: not the centre of a grid cell" % (mx, my)
+    col, row = (mx - 8) // 8, (my - 16) // 8
+    assert tile(py, col, row) == 0, \
+        "the landing marker sits on a bubble (tile %d at %d,%d): its cell has to " \
+        "be one the shot can land in" % (tile(py, col, row), col, row)
+
+    # Fire, and watch the flight. The watch does not stop at the landing frame: it
+    # runs until the dots are back, which is the aim loop resuming, so a dot left
+    # standing through a pop or the drop's slide is caught too.
+    frames(1, "a")
+    flying, back, last, unhidden = False, False, None, []
+    for _ in range(400):
+        py.tick(1, True)
+        fx, fy = oam(py, 0)
+        dots_up = any(oam(py, s) for s in DOT_SLOTS)
+        if fy and fy != parked:                     # off the launcher: in flight
+            flying = True
+            last = (fx, fy)
+            up = [s for s in DOT_SLOTS + MARK_SLOTS if any(oam(py, s))]
+            if up:
+                unhidden.append((up, fy))
+        elif flying and dots_up:                    # ...and the aim loop is back
+            back = True
+            break
+    assert flying, "the shot never left the launcher"
+    assert not unhidden, \
+        "the aim dots / landing marker were still on screen on %d frame(s) of the " \
+        "flight (slots %s, at launcher y=%d): the marker would read as a bubble " \
+        "sitting on the board" % (len(unhidden), unhidden[0][0], unhidden[0][1])
+    assert back, "the aim dots never came back after the shot: the preview is not " \
+                 "meant to be hidden while aiming"
+    assert last and abs(last[0] - mx) <= 16 and abs(last[1] - my) <= 16, \
+        "the shot stopped at OAM %s but the marker was at %d,%d: the preview and the " \
+        "shot disagree about the landing cell, which is what snap() is meant to " \
+        "stop" % (last, mx, my)
+    return "off-ray=%.0fpx land=%s" % (off, last)
+
+
 def first_press_fires(py, frames):
     """Leave the title, and fire on the new board's first press -- no release first.
 
@@ -809,7 +960,21 @@ def check_audio(rom):
     # does not wrap (LEFT/RIGHT clamp at the ends), so holding it is free: the aim
     # key repeat is one step per 3 frames, and 60 of them is more than the 8 steps
     # between the vertical and the stop.
-    tick(60, "right")
+    # ...and the sweep, in which the preview walks the path it copies the flight
+    # step to build -- wall reflections included. That is exactly where an
+    # sfx_bounce() would leak into aiming, so it is watched a frame at a time: the
+    # SFX are short bursts and one from the start of the sweep would be over by the
+    # end of it.
+    aiming = 0
+    for _ in range(60):
+        py.button_press("right")
+        py.tick(1, True)
+        py.button_release("right")
+        aiming |= channels()
+    assert not aiming, \
+        "channel(s) %s ran while only steering: the aim preview's bounces are " \
+        "making the shot's sound" % format(aiming, "04b")
+
     tick(1, "a")
     fire, bounce = False, False
     for _ in range(40):
@@ -981,6 +1146,10 @@ def main():
     # The un-steered shot must be exactly vertical -- see aim_up().
     assert aim_up(py, frames), "the default aim is not straight up"
 
+    # ...and the aim preview must follow the shot's real path, bounced off the
+    # walls, with a marker on the cell it will land in. See check_aim_preview().
+    preview = check_aim_preview(py, frames)
+
     # Fire a few shots; each should stick somewhere, so the board must change.
     seen = {after_shot}
     for _ in range(3):
@@ -1069,9 +1238,9 @@ def main():
     check_drop_keeps_colours(py, frames)
 
     print("ok: sgb_border=%s walls=%d ramp=%s audio=%s after_shot=%d counts=%s score=%d "
-          "drop_scy=%d mid=%d game_over->title=%d frames (A: %d)"
+          "drop_scy=%d mid=%d game_over->title=%d frames (A: %d) preview=%s"
           % (border, walls, ramp, audio, after_shot, sorted(seen), final_score, max(settled),
-             len(mid), gap, skip))
+             len(mid), gap, skip, preview))
     py.stop(save=False)
 
 
