@@ -120,8 +120,9 @@ a headless run never clears a board and so never gets past level 1 to measure th
 Sound is checked in its own console, because the PyBoy the rest of the tests use runs with
 `sound_emulated=False`, where every sound register reads 0 and every write is discarded. Each effect
 has to reach the APU on its own channel: CH1 on firing, CH2 on a wall bounce, CH4 on a pop, and CH3
-on the ceiling drop's warning — which has to sound a whole shot *before* the drop, so that check
-measures the gap between the warning and the slide rather than just its presence.
+on the ceiling drop's warning. The warning is the fiddly one — it has to sound exactly one shot
+before the drop, and exactly once per drop — so that check counts shots and CH3 bursts rather than
+just listening for the tone.
 
 It also checks the shape of the SGB border data, because PyBoy is not a Super Game Boy
 and the upload itself never runs in the test — the sizes png2asset emits are what break

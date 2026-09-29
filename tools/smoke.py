@@ -745,9 +745,17 @@ def check_audio(rom):
 
     Teeth come from what the checks would miss: a shot with no sfx_fire() leaves
     CH1 silent, a wall bounce with no sfx_bounce() leaves CH2 silent, a pop with no
-    sfx_pop() leaves CH4 silent, and a drop warned at the instant it lands -- the
-    off-by-one in sfx_warn()'s call site -- leaves no gap between the CH3 burst and
-    the slide, which is what the gap assertion below measures.
+    sfx_pop() leaves CH4 silent, and a drop warned late -- the off-by-one in
+    sfx_warn()'s call site -- is caught by counting the shots between the burst and
+    the slide, which must be exactly one.
+
+    What this CANNOT see, so do not read it as covering these: sfx_pop() inside the
+    pop loop rather than before it (CH4 retriggers, so N calls are one long burst and
+    one edge), sfx_pop() above the n < MIN_MATCH early return (a non-matching landing
+    still starts CH4 by the assertion's own measure), or a warn that comes EARLY --
+    only the shot count separates "one shot early" from "two", and only the burst
+    count separates it from "every shot". The pop assertion proves CH4 is reachable
+    from resolve(), not how many times resolve() asks for it.
     """
     py = PyBoy(rom, window="null", sound_emulated=True)
 
@@ -819,14 +827,13 @@ def check_audio(rom):
     #
     # `warned` deliberately OUTLIVES the shot it was heard in: the whole point of the
     # warning is that it belongs to the shot BEFORE the drop, so it is always in the
-    # previous shot's window. The gap is measured from the burst to the drop's FIRST
-    # slid frame, which is what makes the off-by-one sign-flip: warning on the drop's
-    # own frame means the CH3 burst is still sounding when the slide starts and the
-    # gap comes out negative. Measured to the settle instead it would come out merely
-    # small -- the burst and the 16-frame slide overlap either way -- and a warn-now
-    # implementation would pass it.
-    warned, gaps, frame = None, [], 0
-    for _ in range(24):
+    # previous shot's window. Counted in SHOTS, not frames: a frame gap has a lower
+    # bound but no useful upper one, so "two shots early" and "every shot" both clear
+    # it. Two shots early is `early == 2`; every shot is caught by `warns`, which
+    # counts BURSTS rather than frames seen high -- one CH3 burst holds NR52's CH3
+    # bit for its whole length, so an edge is the only honest burst count.
+    warned, warn_shot, warns, was_warn, gaps, frame = None, None, 0, False, [], 0
+    for shot in range(24):
         tick(6, "left")
         tick(3, "a")
         slide, slid, prev, n = None, False, None, 0
@@ -834,8 +841,11 @@ def check_audio(rom):
             py.tick(1, True)
             frame += 1
             n += 1
-            if channels() & CH_WARN:
-                warned = frame
+            on = bool(channels() & CH_WARN)
+            if on and not was_warn:
+                warns += 1
+                warned, warn_shot = frame, shot
+            was_warn = on
             scy = py.memory[SCY_REG]
             if scy % 8:
                 slid = True            # mid-slide: the drop is happening now
@@ -845,17 +855,21 @@ def check_audio(rom):
                 assert warned is not None, \
                     "a ceiling drop at frame %d was never warned: sfx_warn() is not " \
                     "wired to the shot before the drop" % slide
-                gaps.append(slide - warned)
+                gaps.append((shot - warn_shot, warns, slide - warned))
                 break
             prev = scy
         if gaps:
             break
 
     assert gaps, "no ceiling drop within 24 shots: the drop warning is untested"
-    assert gaps[0] >= 10, \
-        "the drop warning sounded %d frames before the drop started (%s): it has to " \
-        "be a whole shot earlier, not at the instant the player is punished" % (
-            gaps[0], "still sounding when the slide began" if gaps[0] <= 0 else "too close")
+    early, warns, ahead = gaps[0]
+    assert warns == 1, \
+        "the drop warning sounded %d times before the drop: it is one telegraph per " \
+        "drop, not one per shot" % warns
+    assert early == 1, \
+        "the drop warning came %d shot(s) before the drop (%d frames ahead): it has " \
+        "to be exactly one -- later and the player is warned at the instant they are " \
+        "punished, earlier and it does not read as being about the drop" % (early, ahead)
 
     # A pop. Which shot lands a match is not predictable, so fire until one does --
     # the same shape as the score loop in main().
@@ -874,7 +888,7 @@ def check_audio(rom):
     assert pop, "no pop within 30 shots started CH4: sfx_pop() is not wired to resolve()"
 
     py.stop(save=False)
-    return "fire/bounce/pop/warn(+%df)" % gaps[0]
+    return "fire/bounce/pop/warn(early=%d, bursts=%d)" % (early, warns)
 
 
 def main():
