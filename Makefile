@@ -52,6 +52,10 @@ all: Puzzle-Balloon.gb
 Puzzle-Balloon.gb: $(CFILES) $(HFILES)
 	$(RUN) $(LCC) $(CFLAGS) -o $@ $(CFILES)
 
+# Super Game Boy border packing (slot 0 reserved, limits checked) comes from
+# https://github.com/Zapskii/GB-SGB-Tooling, checked out beside this repo.
+SGB_TOOLING ?= ../GB-SGB-Tooling
+
 # The Super Game Boy border: art/border_sgb.png (256x224; the 160x144 game area
 # at x=48,y=40 is transparent) -> border_data.c/.h. Those are committed, like the
 # sibling projects, so a plain `make` needs no Python. -pack_mode sgb is what gets
@@ -59,8 +63,10 @@ Puzzle-Balloon.gb: $(CFILES) $(HFILES)
 # instead of a GB screen; -use_map_attributes keeps that byte, which is the
 # per-cell palette. Regenerate the art itself with tools/mkborder.py.
 border:
-	$(RUN) $(P2A) art/border_sgb.png -map -bpp 4 -max_palettes 4 \
+	python3 $(SGB_TOOLING)/mkborder.py .border_packed.png --art art/border_sgb.png
+	$(RUN) $(P2A) .border_packed.png -map -bpp 4 -max_palettes 3 -keep_palette_order \
 	      -pack_mode sgb -use_map_attributes -c border_data.c
+	rm -f .border_packed.png
 
 usage: Puzzle-Balloon.gb
 	$(RUN) $(USAGE) Puzzle-Balloon.map -g
