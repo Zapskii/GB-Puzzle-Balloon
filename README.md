@@ -63,12 +63,12 @@ never uploaded, and nothing else looks wrong. `make test` asserts both header by
 
 To see it, run the ROM in an emulator with SGB support. mGBA autodetects from the header,
 so a plain `mgba Puzzle-Balloon.gb` is enough; to force the model, `-C sgb.model=sgb` (or `sgb2`).
-PyBoy cannot show it at all, as it does not emulate the SGB. To redraw or change the
+PyBoy 2.8.0+ does emulate the SGB: `../GB-SGB-Tooling/sgb_border_test.py` boots the ROM in PyBoy 2.8.0+ with SGB emulation on and compares the border the SGB receives with `border_data.c`, and its `gearboy_check.py` compares what Gearboy draws with the art, pixel for pixel. Neither is a real SGB. To redraw or change the
 border art, edit `tools/mkborder.py`, then:
 
 ```sh
 tools/mkborder.py    # art/border_sgb.png
-make border          # border_data.c/.h
+make border          # border_data.c/.h (needs ../GB-SGB-Tooling)
 ```
 
 `border_data.c/.h` are committed, so a plain `make` needs no Python. Mind the two steps:
