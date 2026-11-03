@@ -1,4 +1,4 @@
-[Play online at retro.zapski.com](https://retro.zapski.com)
+🎮 [Play online](https://retro.zapski.com/play/puzzle-balloon) · 📖 [Read the review](https://retro.zapski.com/blog/puzzle-balloon-game-boy-review) · [retro.zapski.com](https://retro.zapski.com)
 
 # Puzzle Balloon
 
